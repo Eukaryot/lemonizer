@@ -1,6 +1,5 @@
-/*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
+*	Lemonizer -- Turns 68K code into lemonscript
+*	Copyright (C) 2017-2026 by Eukaryot
 *
 *	Published under the GNU GPLv3 open source software license, see license.txt
 *	or https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -12,6 +11,19 @@
 
 namespace lemonizer
 {
+	const assembly::AssemblyCode* CodeAssembly::getAssemblyCode(const Code& code)
+	{
+		const CodeAssembly* codeAssembly = code.cast<CodeAssembly>();
+		return (nullptr != codeAssembly) ? codeAssembly->mAssemblyCode : nullptr;
+	}
+
+	const assembly::AssemblyCode* CodeAssembly::getAssemblyCode(const Code& code, assembly::CodeType filterType)
+	{
+		const assembly::AssemblyCode* ac = getAssemblyCode(code);
+		return (nullptr != ac && ac->mType == filterType) ? ac : nullptr;
+	}
+
+
 	lemon::Variable* CodeLemonTokenTree::getRegisterVariable(assembly::Register reg, const assembly::DataType& dataType)
 	{
 		size_t subIndex = (dataType.isSigned() ? 3 : 0);

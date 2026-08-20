@@ -1,6 +1,6 @@
 /*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
+*	Lemonizer -- Turns 68K code into lemonscript
+*	Copyright (C) 2017-2026 by Eukaryot
 *
 *	Published under the GNU GPLv3 open source software license, see license.txt
 *	or https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -175,7 +175,7 @@ namespace assembly
 		{
 			uint32 mValue;
 			uint32 mImmSize;
-		
+
 			explicit ConstantParameter(uint32 value, uint32 immSize) : mValue(value), mImmSize(immSize) {}
 		};
 
@@ -219,12 +219,15 @@ namespace assembly
 		inline bool isPureRegister() const				{ return mType == Type::REGISTER && !mIsMemory; }
 		inline bool isPureRegister(Register reg) const  { return mType == Type::REGISTER && mRegister.mRegister == reg && !mIsMemory; }
 
-		inline bool isConstant() const			{ return mType == Type::CONSTANT; }
-		inline bool isConstantValue() const		{ return mType == Type::CONSTANT && !mIsMemory; }
-		inline bool isConstantMemory() const	{ return mType == Type::CONSTANT && mIsMemory; }
+		inline bool isConstant() const					{ return mType == Type::CONSTANT; }
+		inline bool isConstantValue() const				{ return mType == Type::CONSTANT && !mIsMemory; }
+		inline bool isConstantMemory() const			{ return mType == Type::CONSTANT && mIsMemory; }
 
-		inline bool isCombined() const			{ return mType == Type::COMBINED; }
-		inline bool isCombinedMemory() const	{ return mType == Type::COMBINED && mIsMemory; }
+		inline bool isCombined() const					{ return mType == Type::COMBINED; }
+		inline bool isCombinedMemory() const			{ return mType == Type::COMBINED && mIsMemory; }
+
+		inline bool isCondition() const					{ return mType == Type::CONDITION; }
+		inline bool isSimpleUnconditional() const		{ return (mType == Type::UNDEFINED) || (mType == Type::CONDITION && mCondition.mCondition == Condition::NONE && mCondition.mLoopRegister == ExtRegister::NONE); }
 	};
 
 
@@ -234,6 +237,7 @@ namespace assembly
 	struct AssemblyCode
 	{
 		CodeType mType = CodeType::INVALID;
+		uint32 mAddress = 0;
 		uint32 mLength = 0;
 
 		DataType mDataType;			// Signed can have different meanings (used for MUL and DIV, also "movea", "adda", etc.)
@@ -243,6 +247,8 @@ namespace assembly
 		bool mWriteFlags = false;	// If true, write flags register
 		uint8 mUseCycles = 0xff;	// Used for shifts; 0xff = use default
 		ShiftType mShiftType;		// Only for shifts
+
+		uint32 mCodeGenData = 0;	// Used during code output, usage varies depending on the code type
 	};
 
 

@@ -5,9 +5,9 @@ namespace lemonizer
 {
 	class Block;
 
-	class Optimization
+	class Structuring
 	{
 	public:
-		static void optimize(Block& block);
+		static void createStructuredBlocks(Block& block);
 	};
 }

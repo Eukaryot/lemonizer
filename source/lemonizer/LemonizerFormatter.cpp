@@ -1,6 +1,6 @@
 /*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
+*	Lemonizer -- Turns 68K code into lemonscript
+*	Copyright (C) 2017-2026 by Eukaryot
 *
 *	Published under the GNU GPLv3 open source software license, see license.txt
 *	or https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -10,6 +10,7 @@
 #include "lemonizer/LemonizerFormatter.h"
 #include "lemonizer/LemonizerCode.h"
 #include "assembly/CodeOutputHelper.h"
+#include "builder/KnowledgeBase.h"
 #include <iomanip>
 
 
@@ -161,11 +162,80 @@ namespace lemonizer
 			return str.str();
 		}
 
+		const KnowledgeBase::DefineInfo* getDefineInfo(uint32 address, const assembly::DataType& dataType)
+		{
+			const KnowledgeBase::DefineInfo* result = nullptr;
+			const uint8 bytes = dataType.getSizeInBytes();
+			if (!dataType.isSigned())
+			{
+				result = KnowledgeBase::instance().getDefineInfo(KnowledgeBase::DefineKey(address, bytes, false));
+			}
+			if (result == nullptr && !dataType.isUnsigned())
+			{
+				result = KnowledgeBase::instance().getDefineInfo(KnowledgeBase::DefineKey(address, bytes, true));
+			}
+			return result;
+		}
+
+		const KnowledgeBase::DefineInfo* getDefineInfo(assembly::Register baseRegister, int32 addressOffset, const assembly::DataType& dataType)
+		{
+			const KnowledgeBase::DefineInfo* result = nullptr;
+			const uint8 bytes = dataType.getSizeInBytes();
+			if (!dataType.isSigned())
+			{
+				result = KnowledgeBase::instance().getDefineInfo(KnowledgeBase::DefineKey(baseRegister, addressOffset, bytes, false));
+			}
+			if (result == nullptr && !dataType.isUnsigned())
+			{
+				result = KnowledgeBase::instance().getDefineInfo(KnowledgeBase::DefineKey(baseRegister, addressOffset, bytes, true));
+			}
+			return result;
+		}
+
+		const KnowledgeBase::DefineInfo* getDefineInfoForParameter(const assembly::Parameter& param, const assembly::DataType& dataType)
+		{
+			if (param.mIsMemory)
+			{
+				switch (param.mType)
+				{
+					case assembly::Parameter::Type::CONSTANT:
+					{
+						const uint32 address = param.mConstant.mValue;
+						if (address >= 0xffff0000)
+						{
+							return getDefineInfo(address, dataType);
+						}
+						break;
+					}
+
+					case assembly::Parameter::Type::COMBINED:
+					{
+						if (param.mCombined.mRegister2 == assembly::ExtRegister::NONE)
+						{
+							return getDefineInfo(param.mCombined.mRegister1, param.mCombined.mDisplacement, dataType);
+						}
+						break;
+					}
+				}
+			}
+			return nullptr;
+		}
+
 		std::string getParameterAsString(const assembly::Parameter& param, FormattingOptions& formattingOptions)
 		{
 			if (param.mIsMemory)
 			{
-				return formattingOptions.mDataType.toString() + '[' + getParameterAsStringIgnoreMemory(param, FormattingOptions()) + ']';
+				// Check knowledge base for fitting define information
+				const KnowledgeBase::DefineInfo* defineInfo = getDefineInfoForParameter(param, formattingOptions.mDataType);
+				if (nullptr != defineInfo)
+				{
+					formattingOptions.mDataType.mSign = defineInfo->mKey.mSigned ? assembly::DataType::Sign::SIGNED : assembly::DataType::Sign::UNSIGNED;
+					return defineInfo->mName;
+				}
+				else
+				{
+					return formattingOptions.mDataType.toString() + '[' + getParameterAsStringIgnoreMemory(param, FormattingOptions()) + ']';
+				}
 			}
 			else
 			{
@@ -183,7 +253,15 @@ namespace lemonizer
 		{
 			if (!param.mIsMemory && param.mType == assembly::Parameter::Type::CONSTANT)
 			{
-				return hexString(1 << param.mConstant.mValue, formattingOptions.mDataType);
+				// Prefer using just 4 hex digits where possible - e.g. in "if (D4 & 0x0040)"
+				if (param.mConstant.mValue < 16)
+				{
+					return hexString(1 << param.mConstant.mValue, std::min<size_t>(formattingOptions.mDataType.getSizeInBytes() * 2, 4));
+				}
+				else
+				{
+					return hexString(1 << param.mConstant.mValue, formattingOptions.mDataType);
+				}
 			}
 			else
 			{
@@ -197,7 +275,7 @@ namespace lemonizer
 			return getParameterAsBitValue(param, formattingOptions);
 		}
 
-		const std::string* getConditionStringAndTypeSign(assembly::Condition condition, assembly::DataType::Sign& typeSign, bool comparingToZero)
+		const std::string* getConditionStringAndTypeSign(assembly::Condition condition, assembly::DataType::Sign& outTypeSign, bool comparingToZero)
 		{
 			enum OperatorSign
 			{
@@ -230,20 +308,20 @@ namespace lemonizer
 			switch (operatorSigns[(size_t)condition])
 			{
 				case UNSIGNED:
-					typeSign = assembly::DataType::Sign::UNSIGNED;
+					outTypeSign = assembly::DataType::Sign::UNSIGNED;
 					return &operatorString[(size_t)condition];
 
 				case SIGNED:
-					typeSign = assembly::DataType::Sign::SIGNED;
+					outTypeSign = assembly::DataType::Sign::SIGNED;
 					return &operatorString[(size_t)condition];
 
 				case BOTH:
-					typeSign = assembly::DataType::Sign::UNSPECIFIED;
+					outTypeSign = assembly::DataType::Sign::UNSPECIFIED;
 					return &operatorString[(size_t)condition];
 
 				case NEGATIVE:
 					// When comparing to zero, the value has to be interpreted as signed
-					typeSign = comparingToZero ? assembly::DataType::Sign::SIGNED : assembly::DataType::Sign::UNSIGNED;
+					outTypeSign = comparingToZero ? assembly::DataType::Sign::SIGNED : assembly::DataType::Sign::UNSIGNED;
 					return &operatorString[(size_t)condition];
 			}
 			return nullptr;
@@ -279,6 +357,8 @@ namespace lemonizer
 				case assembly::CodeType::CODE_SHIFT_RIGHT:
 				case assembly::CodeType::CODE_EXTEND_SIGNED:
 				{
+					assembly::DataType dataType = ac.mDataType;
+
 					// Currently only supported are checks that can be done with the result only
 					//  -> Another use-case is carry flag checks (which get wrong output as "aboveEqual.u", "below.u"), but these can't easily be handled
 					switch (condition)
@@ -294,7 +374,6 @@ namespace lemonizer
 						case assembly::Condition::GT:
 						case assembly::Condition::LE:
 						{
-							assembly::DataType dataType = ac.mDataType;
 							const std::string* operatorString = getConditionStringAndTypeSign(condition, dataType.mSign, true);
 							if (nullptr != operatorString)
 							{
@@ -303,10 +382,48 @@ namespace lemonizer
 								text += *operatorString + "0";
 								return text;
 							}
+							break;
 						}
 
-						case assembly::Condition::CC:  return "!carryFlag()";
-						case assembly::Condition::CS:  return "carryFlag()";
+						case assembly::Condition::CC:
+						case assembly::Condition::CS:
+						{
+							// Only handle subtraction for now
+							if (ac.mType == assembly::CodeType::CODE_SUB)
+							{
+								// And also, ensure that only looking at the sign of the result actually gives us the right condition
+								//  -> We can only really ensure this if the subtracted part is a constant not too large
+								if (ac.mParamSource.isConstant() && ac.mParamSource.mConstant.mValue < ((uint32)1 << (dataType.getSizeInBits() - 1)))
+								{
+									dataType.mSign = assembly::DataType::Sign::SIGNED;
+									const std::string dst = getParameterAsString(ac.mParamDest, dataType);
+									if (condition == assembly::Condition::CC)
+									{
+										return dst + " >= 0";
+									}
+									else
+									{
+										return dst + " < 0";
+									}
+								}
+							}
+
+							return (condition == assembly::Condition::CC) ? "!carryFlag()" : "carryFlag()";
+						}
+					}
+					break;
+				}
+
+				case assembly::CodeType::CODE_NOT:
+				{
+					const std::string dst = getParameterAsString(ac.mParamDest, ac.mDataType);
+					if (condition == assembly::Condition::EQ)
+					{
+						return dst + " == 0";
+					}
+					else if (condition == assembly::Condition::NE)
+					{
+						return dst + " != 0";
 					}
 					break;
 				}
@@ -323,7 +440,40 @@ namespace lemonizer
 					}
 					else if (condition == assembly::Condition::NE)
 					{
-						return dst + " & " + src;
+						return "(" + dst + " & " + src + ") != 0";
+					}
+					break;
+				}
+
+				case assembly::CodeType::CODE_SET_BIT:
+				case assembly::CodeType::CODE_CLEAR_BIT:
+				{
+					if (ac.mCodeGenData != 0)
+					{
+						// Use previously defined "_condition" variable
+						if (condition == assembly::Condition::EQ)
+						{
+							return "!_condition" + hexString(ac.mCodeGenData, 6, "");
+						}
+						else if (condition == assembly::Condition::NE)
+						{
+							return "_condition" + hexString(ac.mCodeGenData, 6, "");
+						}
+					}
+					else
+					{
+						assembly::DataType dataType = ac.mDataType;
+						const std::string dst = getParameterAsString(ac.mParamDest, dataType);
+						const std::string src = getParameterAsBitValue(ac.mParamSource, dataType);
+
+						if (condition == assembly::Condition::EQ)
+						{
+							return "(" + dst + " & " + src + ") == 0";
+						}
+						else if (condition == assembly::Condition::NE)
+						{
+							return dst + " & " + src;
+						}
 					}
 					break;
 				}
@@ -343,10 +493,10 @@ namespace lemonizer
 			static const std::string typeString_s32 = "s32";
 			static const std::string typeString_invalid = "<invalid>";
 
-			if (dataType->mClass == lemon::DataTypeDefinition::Class::INTEGER)
+			if (dataType->getClass() == lemon::DataTypeDefinition::Class::INTEGER)
 			{
 				const lemon::IntegerDataType& integerType = dataType->as<lemon::IntegerDataType>();
-				switch (integerType.mBytes)
+				switch (integerType.getBytes())
 				{
 					case 1:  return integerType.mIsSigned ? typeString_s8 : typeString_u8;
 					case 2:  return integerType.mIsSigned ? typeString_s16 : typeString_u16;
@@ -354,6 +504,24 @@ namespace lemonizer
 				}
 			}
 			return typeString_invalid;
+		}
+
+		template<typename T>
+		void outputConstantTokenSigned(Formatter::Output& output, lemon::AnyBaseValue anyBaseValue, bool preferDecimalConstants)
+		{
+			const T value = anyBaseValue.get<T>();
+			if (preferDecimalConstants)
+			{
+				output.addToken(std::to_string(value));
+			}
+			else if (value < 0)
+			{
+				output.addToken("-" + hexString((T)-value));
+			}
+			else
+			{
+				output.addToken(hexString((T)value));
+			}
 		}
 
 	}
@@ -366,38 +534,49 @@ namespace lemonizer
 			case Code::IFELSE:
 			{
 				const CodeIfElse& ci = code.as<CodeIfElse>();
-				std::string text = "if (";
-
-				// Add main condition
-				if (ci.mCondition != assembly::Condition::NONE)
+				if (ci.mConditionRoot.valid())
 				{
-					const assembly::Condition condition = ci.mNegateWholeCondition ? assembly::negateCondition(ci.mCondition) : ci.mCondition;
-					if (nullptr == ci.mAssemblyCode)
-					{
-						text += assembly::CodeOutputHelper::getConditionLongname(condition) + "()";
-					}
-					else
-					{
-						text += getConditionString(*ci.mAssemblyCode, condition);
-					}
+					// Translate lemonscript
+					output.addToken("if (");
+					formatLemonTokenTreeNode(*ci.mConditionRoot.get(), output);
+					output.addToken(")");
 				}
-
-				// Add loop condition
-				if (ci.mLoopRegister != assembly::ExtRegister::NONE)
+				else
 				{
+					std::string text = "if (";
+					const bool hasLoopRegister = (ci.mLoopRegister != assembly::ExtRegister::NONE);
+
+					// Add main condition
 					if (ci.mCondition != assembly::Condition::NONE)
 					{
-						text += ci.mNegateWholeCondition ? " || " : " && ";
+						const assembly::Condition condition = (ci.mNegateWholeCondition != hasLoopRegister) ? assembly::negateCondition(ci.mCondition) : ci.mCondition;
+						if (ci.mConditionAssemblyCode == nullptr)
+						{
+							text += assembly::CodeOutputHelper::getConditionLongname(condition) + "()";
+						}
+						else
+						{
+							text += getConditionString(*ci.mConditionAssemblyCode, condition);
+						}
 					}
 
-					const std::string registerName = getRegisterName(ci.mLoopRegister, assembly::DataType(assembly::DataType::Size::SIZE_16, assembly::DataType::Sign::SIGNED));
-					output.addToken("--" + registerName);
-					output.newLine();
-					text += registerName + (ci.mNegateWholeCondition ? " < 0" : " >= 0");
-				}
+					// Add loop condition
+					if (hasLoopRegister)
+					{
+						if (ci.mCondition != assembly::Condition::NONE)
+						{
+							text += ci.mNegateWholeCondition ? " || " : " && ";
+						}
 
-				text += ")";
-				output.addToken(text);
+						const std::string registerName = getRegisterName(ci.mLoopRegister, assembly::DataType(assembly::DataType::Size::SIZE_16, assembly::DataType::Sign::SIGNED));
+						output.addToken("--" + registerName);
+						output.newLine();
+						text += registerName + (ci.mNegateWholeCondition ? " < 0" : " >= 0");
+					}
+
+					text += ")";
+					output.addToken(text);
+				}
 				break;
 			}
 
@@ -411,16 +590,40 @@ namespace lemonizer
 			case Code::JUMP_OR_CALL:
 			{
 				const CodeJumpOrCall& cj = code.as<CodeJumpOrCall>();
-				const JumpCallFormatting jcf = (cj.mIsCall) ? JumpCallFormatting::CALL :
-											   (cj.mLines.front()->mLeadsToLabel) ? JumpCallFormatting::JUMP : JumpCallFormatting::CALL_RETURN;
-				formatJumpCall(jcf, cj.mDestinationAddress, output);
+				JumpCallFormatting jcf;
+				if (cj.mIsCall)
+				{
+					jcf = JumpCallFormatting::CALL;
+				}
+				else
+				{
+					const bool outputAsCallReturn = (mGlobalSettings.mOutputFarJumpsAsCallReturn && !cj.mLines.front()->mLeadsToLabel);
+					jcf = outputAsCallReturn ? JumpCallFormatting::CALL_RETURN : JumpCallFormatting::JUMP;
+				}
+				formatJumpCall(jcf, cj.mDestinationAddress, code.mLines.back()->mAddress + 2, output);	// Return address could be off in this case
 				break;
 			}
 
-			case Code::BREAK_OR_CONTINUE:
+			case Code::RETURN:
 			{
-				const CodeBreakOrContinue& cboc = code.as<CodeBreakOrContinue>();
-				output.addToken(cboc.mIsContinue ? "continue" : "break");
+				if (mGlobalSettings.mPushPopAddressOnCall)
+				{
+					output.addToken("asm_return()");
+					output.newLine();
+				}
+				output.addToken("return");
+				break;
+			}
+
+			case Code::BREAK:
+			{
+				output.addToken("break");
+				break;
+			}
+
+			case Code::CONTINUE:
+			{
+				output.addToken("continue");
 				break;
 			}
 
@@ -458,18 +661,11 @@ namespace lemonizer
 				{
 					// Signed is always s32(...) = s16(...)
 					dstType = assembly::DataType(assembly::DataType::Size::SIZE_32, assembly::DataType::Sign::SIGNED);
-					if (code.mParamDest.mType == assembly::Parameter::Type::REGISTER)
+
+					// However, if we already that know the right side is positive, make it an unsigned assignment
+					if (code.mParamSource.isConstantValue() && code.mParamSource.mConstant.mValue <= 0x7fff)
 					{
-						// Special handling for assignments to address registers
-						//  -> Use the more obvious output as e.g. "A0 = 0xffff0000 + D0.u16"
-						if (code.mParamDest.mRegister.mRegister >= assembly::Register::A0 && code.mParamDest.mRegister.mRegister <= assembly::Register::A7)
-						{
-							dstType.mSign = assembly::DataType::Sign::UNSPECIFIED;
-							const std::string dst = getParameterAsString(code.mParamDest, dstType);
-							const std::string src = getParameterAsString(code.mParamSource, assembly::DataType::u16);
-							output.addToken(dst + " = 0xffff0000 + " + src);
-							return true;
-						}
+						dstType = assembly::DataType(assembly::DataType::Size::SIZE_32, assembly::DataType::Sign::UNSIGNED);
 					}
 				}
 
@@ -482,7 +678,20 @@ namespace lemonizer
 				{
 					assembly::DataType srcType = code.mDataType.isSigned() ? assembly::DataType::s16 : dataType;
 					const std::string src = getParameterAsString(code.mParamSource, srcType);
-					output.addToken(dst + " = " + src);
+
+					// Check for nasty cases like "u16[A7-=2] = u16[A7 + 0x04]", where order of execution would matter, and actually conflict with lemonscript's order of execution (namely left side memory address gets evaluated first)
+					if (code.mParamDest.isRegister() && code.mParamDest.mIsMemory && (code.mParamDest.mRegister.mPreDecrement != 0 || code.mParamDest.mRegister.mPostIncrement != 0) &&
+						code.mParamSource.isCombinedMemory() && code.mParamSource.mCombined.mRegister1 == code.mParamDest.mRegister.mRegister)
+					{
+						// Split into two lines
+						output.addToken(dstType.toString() + " tmp = " + src);
+						output.newLine();
+						output.addToken(dst + " = tmp");
+					}
+					else
+					{
+						output.addToken(dst + " = " + src);
+					}
 				}
 				return true;
 			}
@@ -501,7 +710,19 @@ namespace lemonizer
 					return false;
 
 				const std::vector<assembly::Register> registers = assembly::CodeOutputHelper::getRegisterListFromBitmask(code.mParamDest.mConstant.mValue);
-				if (code.mParamSource.mType == assembly::Parameter::Type::REGISTER)
+				if (code.mParamSource.mType == assembly::Parameter::Type::CONSTANT)
+				{
+					for (size_t i = 0; i < registers.size(); ++i)
+					{
+						if (i > 0)
+							output.newLine();
+
+						const int address = code.mParamSource.mConstant.mValue + (int)i * dataType.getSizeInBytes();
+						const std::string dst = getRegisterName(registers[i], dataType);
+						output.addToken(dst + " = " + code.mDataType.toString() + "[" + hexString(address) + "]");
+					}
+				}
+				else if (code.mParamSource.mType == assembly::Parameter::Type::REGISTER)
 				{
 					for (size_t i = 0; i < registers.size(); ++i)
 					{
@@ -559,7 +780,19 @@ namespace lemonizer
 					return false;
 
 				const std::vector<assembly::Register> registers = assembly::CodeOutputHelper::getRegisterListFromBitmask(code.mParamSource.mConstant.mValue);
-				if (code.mParamDest.mType == assembly::Parameter::Type::REGISTER)
+				if (code.mParamDest.mType == assembly::Parameter::Type::CONSTANT)
+				{
+					for (size_t i = 0; i < registers.size(); ++i)
+					{
+						if (i > 0)
+							output.newLine();
+
+						const int address = code.mParamDest.mConstant.mValue + (int)i * dataType.getSizeInBytes();
+						const std::string src = getRegisterName(registers[i], dataType);
+						output.addToken(code.mDataType.toString() + "[" + hexString(address) + "] = " + src);
+					}
+				}
+				else if (code.mParamDest.mType == assembly::Parameter::Type::REGISTER)
 				{
 					for (size_t i = 0; i < registers.size(); ++i)
 					{
@@ -832,7 +1065,7 @@ namespace lemonizer
 						const std::string dst = getParameterAsString(code.mParamDest, dataType);
 						const std::string fwdShift = dst + (shiftRight ? " >> " : " << ") + std::to_string(shiftValue);
 						const std::string invShift = dst + (shiftRight ? " << " : " >> ") + std::to_string(invShiftValue);
-						
+
 						std::string outString = dst + " = (" + fwdShift + ") + (" + invShift + ")";
 						if (code.mShiftType == assembly::ShiftType::ROTATE_X)
 						{
@@ -850,6 +1083,13 @@ namespace lemonizer
 				dataType.mSign = assembly::DataType::Sign::UNSIGNED;
 				const std::string dst = getParameterAsString(code.mParamDest, dataType);
 				const std::string src = getParameterAsBitValue(code.mParamSource, dataType);
+
+				if (code.mCodeGenData != 0)
+				{
+					output.addToken("bool _condition" + hexString(code.mCodeGenData, 6, "") + " = " + dst + " & " + src);
+					output.newLine();
+				}
+
 				output.addToken(dst + " |= " + src);
 				return true;
 			}
@@ -859,6 +1099,13 @@ namespace lemonizer
 				dataType.mSign = assembly::DataType::Sign::UNSIGNED;
 				const std::string dst = getParameterAsString(code.mParamDest, dataType);
 				const std::string src = getParameterAsBitValue(code.mParamSource, dataType);
+
+				if (code.mCodeGenData != 0)
+				{
+					output.addToken("bool _condition" + hexString(code.mCodeGenData, 6, "") + " = " + dst + " & " + src);
+					output.newLine();
+				}
+
 				output.addToken(dst + " &= ~" + src);
 				return true;
 			}
@@ -900,15 +1147,30 @@ namespace lemonizer
 
 			case assembly::CodeType::CODE_LINK:
 			{
-				const std::string dst = getParameterAsString(code.mParamDest, assembly::DataType::u32);
-				output.addToken(dst + " = link(" + dst + ", " + getParameterAsString(code.mParamSource, assembly::DataType::s16) + ")");
+				if (code.mParamDest.isPureRegister() && code.mParamDest.mRegister.mRegister == assembly::Register::A6)
+				{
+					output.addToken("createStackFrame_A6(" + getParameterAsString(code.mParamSource, assembly::DataType::s16) + ")");
+
+				}
+				else
+				{
+					const std::string dst = getParameterAsString(code.mParamDest, assembly::DataType::u32);
+					output.addToken(dst + " = createStackFrame(" + dst + ", " + getParameterAsString(code.mParamSource, assembly::DataType::s16) + ")");
+				}
 				return true;
 			}
 
 			case assembly::CodeType::CODE_UNLINK:
 			{
-				const std::string dst = getParameterAsString(code.mParamDest, assembly::DataType::u32);
-				output.addToken(dst + " = unlink(" + dst + ")");
+				if (code.mParamDest.isPureRegister() && code.mParamDest.mRegister.mRegister == assembly::Register::A6)
+				{
+					output.addToken("resolveStackFrame_A6()");
+				}
+				else
+				{
+					const std::string dst = getParameterAsString(code.mParamDest, assembly::DataType::u32);
+					output.addToken(dst + " = resolveStackFrame(" + dst + ")");
+				}
 				return true;
 			}
 
@@ -917,7 +1179,8 @@ namespace lemonizer
 				// Output only unconditional jumps
 				if (code.mParamSource.mType != assembly::Parameter::Type::CONDITION)
 				{
-					formatJumpCall(JumpCallFormatting::CALL_RETURN, code.mParamDest, output);
+					const JumpCallFormatting jcf = mGlobalSettings.mOutputFarJumpsAsCallReturn ? JumpCallFormatting::CALL_RETURN : JumpCallFormatting::JUMP;
+					formatJumpCall(jcf, code.mParamDest, code.mAddress + code.mLength, output);
 					return true;
 				}
 				break;
@@ -925,114 +1188,176 @@ namespace lemonizer
 
 			case assembly::CodeType::CODE_CALL:
 			{
-				formatJumpCall(JumpCallFormatting::CALL, code.mParamDest, output);
+				formatJumpCall(JumpCallFormatting::CALL, code.mParamDest, code.mAddress + code.mLength, output);
 				return true;
 			}
 
 			case assembly::CodeType::CODE_RETURN:
 			{
+				if (mGlobalSettings.mPushPopAddressOnCall)
+				{
+					output.addToken("asm_return()");
+					output.newLine();
+				}
 				output.addToken("return");
 				return true;
 			}
 		}
-		
+
 		return false;
 	}
 
-	void Formatter::formatLemonTokenTreeNode(const lemon::StatementToken& token, Output& output)
+	void Formatter::formatLemonTokenTreeNode(const lemon::StatementToken& token, Output& output, bool useCompactNotation, bool preferDecimalConstants)
 	{
 		switch (token.getType())
 		{
-			case lemon::Token::Type::CONSTANT:
+			case lemon::ConstantTokenExt::TYPE:
 			{
-				const lemon::ConstantToken& constantToken = token.as<lemon::ConstantToken>();
-				if (constantToken.mValue == 0)
+				const lemon::ConstantTokenExt& constantToken = token.as<lemon::ConstantTokenExt>();
+				if (constantToken.mValue.get<uint64>() == 0)
 				{
 					output.addToken("0");
+					break;
 				}
-				else if (constantToken.mDataType == &lemon::PredefinedDataTypes::UINT_32)
+
+				if (constantToken.mOutputAsDecimal)
 				{
-					output.addToken(hexString((uint32)constantToken.mValue, 6));
+					preferDecimalConstants = true;
 				}
-				else if (constantToken.mDataType == &lemon::PredefinedDataTypes::UINT_8 && constantToken.mValue <= 2)
+
+				// Handle signed values
+				if (nullptr != constantToken.mDataType && constantToken.mDataType->as<lemon::IntegerDataType>().mIsSigned)
 				{
-					output.addToken(std::to_string(constantToken.mValue));
+					if (constantToken.mDataType == &lemon::PredefinedDataTypes::INT_8)
+					{
+						outputConstantTokenSigned<int8>(output, constantToken.mValue, preferDecimalConstants);
+						break;
+					}
+					else if (constantToken.mDataType == &lemon::PredefinedDataTypes::INT_16)
+					{
+						outputConstantTokenSigned<int16>(output, constantToken.mValue, preferDecimalConstants);
+						break;
+					}
+					else if (constantToken.mDataType == &lemon::PredefinedDataTypes::INT_32)
+					{
+						outputConstantTokenSigned<int32>(output, constantToken.mValue, preferDecimalConstants);
+						break;
+					}
+				}
+
+				const uint64 value = constantToken.mValue.get<uint64>();
+				if (preferDecimalConstants)
+				{
+					output.addToken(std::to_string(value));
+				}
+				else if (constantToken.mOutputWithDataTypeSize && nullptr != constantToken.mDataType)
+				{
+					if (constantToken.mDataType->getBytes() == 1)
+					{
+						output.addToken(hexString((uint32)value, 2));
+					}
+					else if (constantToken.mDataType->getBytes() == 2)
+					{
+						output.addToken(hexString((uint32)value, 4));
+					}
+					else if (constantToken.mDataType->getBytes() == 4)
+					{
+						output.addToken(hexString((uint32)value, 6));
+					}
+					else
+					{
+						output.addToken(hexString((uint32)value));
+					}
+				}
+				else if (constantToken.mOutputAsAddress)
+				{
+					output.addToken(hexString((uint32)value, 6));
 				}
 				else
 				{
-					output.addToken(hexString((uint32)constantToken.mValue));
+					output.addToken(hexString((uint32)value));
 				}
 				break;
 			}
 
-			case lemon::Token::Type::IDENTIFIER:
+			case lemon::IdentifierToken::TYPE:
 			{
 				const lemon::IdentifierToken& identifierToken = token.as<lemon::IdentifierToken>();
-				output.addToken(identifierToken.mIdentifier);
+				output.addToken(identifierToken.mName.getString());
 				break;
 			}
 
-			case lemon::Token::Type::PARENTHESIS:
+			case lemon::ParenthesisToken::TYPE:
 			{
 				const lemon::ParenthesisToken& parenthesisToken = token.as<lemon::ParenthesisToken>();
 				static const char* charactersLookup[2][2] = { { "(", ")" }, { "[", "]" } };
 				const char** characters = charactersLookup[(size_t)parenthesisToken.mParenthesisType];
 				output.addToken(characters[0]);
-				formatLemonTokenTreeNode(parenthesisToken.mContent[0].as<lemon::StatementToken>(), output);
+				formatLemonTokenTreeNode(parenthesisToken.mContent[0].as<lemon::StatementToken>(), output, useCompactNotation);
 				output.addToken(characters[1]);
 				break;
 			}
 
-			case lemon::Token::Type::UNARY_OPERATION:
+			case lemon::UnaryOperationToken::TYPE:
 			{
 				const lemon::UnaryOperationToken& uot = token.as<lemon::UnaryOperationToken>();
 				switch (uot.mOperator)
 				{
-					case lemon::Operator::UNARY_INCREMENT:	output.addToken("++");   break;
-					case lemon::Operator::UNARY_DECREMENT:	output.addToken("--");   break;
+					case lemon::Operator::UNARY_INCREMENT:	output.addToken("++");  break;
+					case lemon::Operator::UNARY_DECREMENT:	output.addToken("--");  break;
 					case lemon::Operator::UNARY_BITNOT:		output.addToken("~");   break;
 					case lemon::Operator::UNARY_NOT:		output.addToken("!");   break;
+					case lemon::Operator::BINARY_MINUS:		output.addToken("-");   break;
 				}
-				formatLemonTokenTreeNode(*uot.mArgument.get(), output);
+				formatLemonTokenTreeNode(*uot.mArgument.get(), output, useCompactNotation);
 				break;
 			}
 
-			case lemon::Token::Type::BINARY_OPERATION:
+			case lemon::BinaryOperationToken::TYPE:
 			{
 				const lemon::BinaryOperationToken& bot = token.as<lemon::BinaryOperationToken>();
-				formatLemonTokenTreeNode(*bot.mLeft.get(), output);
+				formatLemonTokenTreeNode(*bot.mLeft.get(), output, useCompactNotation);
+
+				bool preferDecimalConstants = false;
 				switch (bot.mOperator)
 				{
-					case lemon::Operator::ASSIGN:				output.addToken(" = ");   break;
-					case lemon::Operator::ASSIGN_PLUS:			output.addToken(" += ");  break;
-					case lemon::Operator::ASSIGN_MINUS:			output.addToken(" -= ");  break;
-					case lemon::Operator::ASSIGN_MULTIPLY:		output.addToken(" *= ");  break;
-					case lemon::Operator::ASSIGN_DIVIDE:		output.addToken(" /= ");  break;
-					case lemon::Operator::ASSIGN_MODULO:		output.addToken(" %= ");  break;
-					case lemon::Operator::ASSIGN_SHIFT_LEFT:	output.addToken(" <<= "); break;
-					case lemon::Operator::ASSIGN_SHIFT_RIGHT:	output.addToken(" >>= "); break;
-					case lemon::Operator::ASSIGN_AND:			output.addToken(" &= ");  break;
-					case lemon::Operator::ASSIGN_OR:			output.addToken(" |= ");  break;
-					case lemon::Operator::ASSIGN_XOR:			output.addToken(" ^= ");  break;
-					case lemon::Operator::BINARY_PLUS:			output.addToken(" + ");   break;
-					case lemon::Operator::BINARY_MINUS:			output.addToken(" - ");   break;
-					case lemon::Operator::BINARY_MULTIPLY:		output.addToken(" * ");   break;
-					case lemon::Operator::BINARY_DIVIDE:		output.addToken(" / ");   break;
-					case lemon::Operator::BINARY_MODULO:		output.addToken(" % ");   break;
-					case lemon::Operator::BINARY_SHIFT_LEFT:	output.addToken(" << ");  break;
-					case lemon::Operator::BINARY_SHIFT_RIGHT:	output.addToken(" >> ");  break;
-					case lemon::Operator::BINARY_AND:			output.addToken(" & ");   break;
-					case lemon::Operator::BINARY_OR:			output.addToken(" | ");   break;
-					case lemon::Operator::BINARY_XOR:			output.addToken(" ^ ");   break;
-					case lemon::Operator::LOGICAL_AND:			output.addToken(" && ");  break;
-					case lemon::Operator::LOGICAL_OR:			output.addToken(" || ");  break;
-					// TODO: Support more
+					case lemon::Operator::ASSIGN:					output.addToken(useCompactNotation ? "="   : " = ");   break;
+					case lemon::Operator::ASSIGN_PLUS:				output.addToken(useCompactNotation ? "+="  : " += ");  break;
+					case lemon::Operator::ASSIGN_MINUS:				output.addToken(useCompactNotation ? "-="  : " -= ");  break;
+					case lemon::Operator::ASSIGN_MULTIPLY:			output.addToken(useCompactNotation ? "*="  : " *= ");  break;
+					case lemon::Operator::ASSIGN_DIVIDE:			output.addToken(useCompactNotation ? "/="  : " /= ");  break;
+					case lemon::Operator::ASSIGN_MODULO:			output.addToken(useCompactNotation ? "%="  : " %= ");  break;
+					case lemon::Operator::ASSIGN_SHIFT_LEFT:		output.addToken(useCompactNotation ? "<<=" : " <<= "); preferDecimalConstants = true;  break;
+					case lemon::Operator::ASSIGN_SHIFT_RIGHT:		output.addToken(useCompactNotation ? ">>=" : " >>= "); preferDecimalConstants = true;  break;
+					case lemon::Operator::ASSIGN_AND:				output.addToken(useCompactNotation ? "&="  : " &= ");  break;
+					case lemon::Operator::ASSIGN_OR:				output.addToken(useCompactNotation ? "|="  : " |= ");  break;
+					case lemon::Operator::ASSIGN_XOR:				output.addToken(useCompactNotation ? "^="  : " ^= ");  break;
+					case lemon::Operator::BINARY_PLUS:				output.addToken(useCompactNotation ? "+"   : " + ");   break;
+					case lemon::Operator::BINARY_MINUS:				output.addToken(useCompactNotation ? "-"   : " - ");   break;
+					case lemon::Operator::BINARY_MULTIPLY:			output.addToken(useCompactNotation ? "*"   : " * ");   break;
+					case lemon::Operator::BINARY_DIVIDE:			output.addToken(useCompactNotation ? "/"   : " / ");   break;
+					case lemon::Operator::BINARY_MODULO:			output.addToken(useCompactNotation ? "%"   : " % ");   break;
+					case lemon::Operator::BINARY_SHIFT_LEFT:		output.addToken(useCompactNotation ? "<<"  : " << ");  preferDecimalConstants = true;  break;
+					case lemon::Operator::BINARY_SHIFT_RIGHT:		output.addToken(useCompactNotation ? ">>"  : " >> ");  preferDecimalConstants = true;  break;
+					case lemon::Operator::BINARY_AND:				output.addToken(useCompactNotation ? "&"   : " & ");   break;
+					case lemon::Operator::BINARY_OR:				output.addToken(useCompactNotation ? "|"   : " | ");   break;
+					case lemon::Operator::BINARY_XOR:				output.addToken(useCompactNotation ? "^"   : " ^ ");   break;
+					case lemon::Operator::LOGICAL_AND:				output.addToken(useCompactNotation ? "&&"  : " && ");  break;
+					case lemon::Operator::LOGICAL_OR:				output.addToken(useCompactNotation ? "||"  : " || ");  break;
+					case lemon::Operator::COMPARE_EQUAL:			output.addToken(useCompactNotation ? "=="  : " == ");  break;
+					case lemon::Operator::COMPARE_NOT_EQUAL:		output.addToken(useCompactNotation ? "!="  : " != ");  break;
+					case lemon::Operator::COMPARE_LESS:				output.addToken(useCompactNotation ? "<"   : " < ");   break;
+					case lemon::Operator::COMPARE_LESS_OR_EQUAL:	output.addToken(useCompactNotation ? "<="  : " <= ");  break;
+					case lemon::Operator::COMPARE_GREATER:			output.addToken(useCompactNotation ? ">"   : " > ");   break;
+					case lemon::Operator::COMPARE_GREATER_OR_EQUAL:	output.addToken(useCompactNotation ? ">="  : " >= ");  break;
+					case lemon::Operator::QUESTIONMARK:				output.addToken(useCompactNotation ? "?"   : " ? ");   break;
+					case lemon::Operator::COLON:					output.addToken(useCompactNotation ? ":"   : " : ");   break;
 				}
-				formatLemonTokenTreeNode(*bot.mRight.get(), output);
+				formatLemonTokenTreeNode(*bot.mRight.get(), output, useCompactNotation, preferDecimalConstants);
 				break;
 			}
 
-			case lemon::Token::Type::VARIABLE:
+			case lemon::VariableToken::TYPE:
 			{
 				// Only the registers are using "lemon::VariableToken", all defines are using "lemon::IdentifierToken" instead
 				const lemon::VariableToken& variableToken = token.as<lemon::VariableToken>();
@@ -1043,37 +1368,51 @@ namespace lemonizer
 				break;
 			}
 
-			case lemon::Token::Type::MEMORY_ACCESS:
+			case lemon::MemoryAccessToken::TYPE:
 			{
 				const lemon::MemoryAccessToken& memoryAccessToken = token.as<lemon::MemoryAccessToken>();
 				output.addToken(getLemonDataTypeString(memoryAccessToken.mDataType));
 				output.addToken("[");
-				formatLemonTokenTreeNode(*memoryAccessToken.mAddress.get(), output);
+
+				// Special case: If the memory address is a register with post increment (like "(A0+=1)-1"), then use compact notation without spaces
+				//  -> Note that the detection of this case is rather basic, but it works, so it's probably okay
+				const bool isPostIncrementRegister = (memoryAccessToken.mAddress->isA<lemon::BinaryOperationToken>() && memoryAccessToken.mAddress->as<lemon::BinaryOperationToken>().mLeft->isA<lemon::ParenthesisToken>());
+				formatLemonTokenTreeNode(*memoryAccessToken.mAddress.get(), output, useCompactNotation || isPostIncrementRegister);
 				output.addToken("]");
 				break;
 			}
 
-			case lemon::Token::Type::VALUE_CAST:
+			case lemon::ValueCastToken::TYPE:
 			{
 				const lemon::ValueCastToken& valueCastToken = token.as<lemon::ValueCastToken>();
 				output.addToken(getLemonDataTypeString(valueCastToken.mDataType));
 				output.addToken("(");
-				formatLemonTokenTreeNode(*valueCastToken.mArgument.get(), output);
+				formatLemonTokenTreeNode(*valueCastToken.mArgument.get(), output, useCompactNotation);
 				output.addToken(")");
 				break;
 			}
 		}
 	}
 
-	void Formatter::formatJumpCall(JumpCallFormatting jumpCallFormatting, const assembly::Parameter& paramDest, Output& output)
+	void Formatter::formatJumpCall(JumpCallFormatting jumpCallFormatting, const assembly::Parameter& paramDest, uint32 returnAddress, Output& output)
 	{
 		// Fixed destination?
 		if (paramDest.mType == assembly::Parameter::Type::CONSTANT)
 		{
-			formatJumpCall(jumpCallFormatting, paramDest.mConstant.mValue, output);
+			formatJumpCall(jumpCallFormatting, paramDest.mConstant.mValue, returnAddress, output);
 		}
 		else
 		{
+			const bool addPush = (jumpCallFormatting == JumpCallFormatting::CALL) && mGlobalSettings.mPushPopAddressOnCall;
+			if (addPush)
+			{
+				if (mGlobalSettings.mPreCallWithReturnAddress)
+					output.addToken("pre_call(" + rmx::hexString(returnAddress, 6) + ")");
+				else
+					output.addToken("pre_call()");
+				output.newLine();
+			}
+
 			const std::string dst = getParameterAsStringIgnoreMemory(paramDest, assembly::DataType());
 			output.addToken(((jumpCallFormatting != JumpCallFormatting::JUMP) ? "call " : "jump ") + dst);
 
@@ -1085,10 +1424,28 @@ namespace lemonizer
 		}
 	}
 
-	void Formatter::formatJumpCall(JumpCallFormatting jumpCallFormatting, uint32 destAddress, Output& output)
+	void Formatter::formatJumpCall(JumpCallFormatting jumpCallFormatting, uint32 destAddress, uint32 returnAddress, Output& output)
 	{
-		output.addToken((jumpCallFormatting != JumpCallFormatting::JUMP) ? "call " : "jump ");
-		output.addToken(Token::JUMP_TARGET, hexString(destAddress, 6), destAddress);
+		const bool addPush = (jumpCallFormatting == JumpCallFormatting::CALL) && mGlobalSettings.mPushPopAddressOnCall;
+		if (addPush)
+		{
+			if (mGlobalSettings.mPreCallWithReturnAddress)
+				output.addToken("pre_call(" + rmx::hexString(returnAddress, 6) + ")");
+			else
+				output.addToken("pre_call()");
+			output.newLine();
+		}
+
+		const KnowledgeBase::FunctionInfo* functionInfo = KnowledgeBase::instance().getFunctionInfo(destAddress);
+		if (nullptr != functionInfo && functionInfo->mAutomaticCallReplacement && jumpCallFormatting != JumpCallFormatting::JUMP)
+		{
+			output.addToken(Token::JUMP_TARGET, functionInfo->mName + "()", destAddress);
+		}
+		else
+		{
+			output.addToken((jumpCallFormatting != JumpCallFormatting::JUMP) ? "call " : "jump ");
+			output.addToken(Token::JUMP_TARGET, hexString(destAddress, 6), destAddress);
+		}
 
 		if (jumpCallFormatting == JumpCallFormatting::CALL_RETURN)
 		{

@@ -1,6 +1,6 @@
 /*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
+*	Lemonizer -- Turns 68K code into lemonscript
+*	Copyright (C) 2017-2026 by Eukaryot
 *
 *	Published under the GNU GPLv3 open source software license, see license.txt
 *	or https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -9,6 +9,7 @@
 #define RMX_LIB
 #include "pch.h"
 #include "helper/PlatformFunctions.h"
+#include "builder/KnowledgeBase.h"
 #include "builder/ProjectData.h"
 #include "builder/RomContent.h"
 #include "writer/HtmlWriter.h"
@@ -52,6 +53,9 @@ int main(int argc, char** argv)
 	RomContent romContent;
 	if (!romContent.loadRom(projectPath + projectData.mRomFile))
 		return 0;
+
+	// Knowledge base stays empty for now (though we could fill it in with definitions loaded from lemonscript or a JSON)
+	KnowledgeBase knowledgeBase;
 
 	// Write output
 	std::cout << "Writing output files into project directory '" << WString(projectPath).toStdString() << "'" << std::endl;

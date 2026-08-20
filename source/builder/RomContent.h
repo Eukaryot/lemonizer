@@ -1,6 +1,6 @@
 /*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
+*	Lemonizer -- Turns 68K code into lemonscript
+*	Copyright (C) 2017-2026 by Eukaryot
 *
 *	Published under the GNU GPLv3 open source software license, see license.txt
 *	or https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -47,14 +47,14 @@ public:
 		enum
 		{
 			// Presence & source of entry
-			PRESENT		= 1<<0,		// There is an opcode at the given address; this is a requirement for any other flag to be set
-			EXECUTED	= 1<<1,		// Entry was found or is confirmed by run-time execution (i.e. not only static analysis)
+			PRESENT		= 1 << 0,	// There is an opcode at the given address; this is a requirement for any other flag to be set
+			EXECUTED	= 1 << 1,	// Entry was found or is confirmed by run-time execution (i.e. not only static analysis)
 
 			// Jump type
-			JUMP		= 1<<8,		// Opcode is an unconditional jump
-			COND_JUMP	= 1<<9,		// Opcode is a conditional jump
-			CALL		= 1<<10,	// Opcode is a "call", i.e. a jump with return afterwards
-			RETURN		= 1<<11,	// Opcode is a "return", i.e. a jump to the location after the last call on stack
+			JUMP		= 1 << 8,	// Opcode is an unconditional jump
+			COND_JUMP	= 1 << 9,	// Opcode is a conditional jump
+			CALL		= 1 << 10,	// Opcode is a "call", i.e. a jump with return afterwards
+			RETURN		= 1 << 11,	// Opcode is a "return", i.e. a jump to the location after the last call on stack
 			ANY_JUMP	= JUMP + COND_JUMP + CALL + RETURN,
 		};
 	};

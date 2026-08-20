@@ -1,6 +1,6 @@
 /*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
+*	Lemonizer -- Turns 68K code into lemonscript
+*	Copyright (C) 2017-2026 by Eukaryot
 *
 *	Published under the GNU GPLv3 open source software license, see license.txt
 *	or https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -15,7 +15,7 @@ namespace assembly
 
 	const OpcodeType OpcodeTable::mOpcodeTable[0x10000] =
 	{
-		OPCODE_ori_8_d,		OPCODE_ori_8_d,		OPCODE_ori_8_d,		OPCODE_ori_8_d,		OPCODE_ori_8_d,		OPCODE_ori_8_d,		OPCODE_ori_8_d,		OPCODE_ori_8_d, 
+		OPCODE_ori_8_d,		OPCODE_ori_8_d,	OPCODE_ori_8_d,	OPCODE_ori_8_d,	OPCODE_ori_8_d,	OPCODE_ori_8_d,	OPCODE_ori_8_d,	OPCODE_ori_8_d, 
 		OPCODE_illegal,		OPCODE_illegal,		OPCODE_illegal,		OPCODE_illegal,		OPCODE_illegal,		OPCODE_illegal,		OPCODE_illegal,		OPCODE_illegal, 
 		OPCODE_ori_8_ai,	OPCODE_ori_8_ai,	OPCODE_ori_8_ai,	OPCODE_ori_8_ai,	OPCODE_ori_8_ai,	OPCODE_ori_8_ai,	OPCODE_ori_8_ai,	OPCODE_ori_8_ai, 
 		OPCODE_ori_8_pi,	OPCODE_ori_8_pi,	OPCODE_ori_8_pi,	OPCODE_ori_8_pi,	OPCODE_ori_8_pi,	OPCODE_ori_8_pi,	OPCODE_ori_8_pi,	OPCODE_ori_8_pi7, 

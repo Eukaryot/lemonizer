@@ -1,17 +1,13 @@
-/*
-*	Lemonizer -- turns 68K code into lemon script
-*	Copyright (C) 2021 by Eukaryot
-*
-*	Published under the GNU GPLv3 open source software license, see license.txt
-*	or https://www.gnu.org/licenses/gpl-3.0.en.html
-*/
-
 #include "pch.h"
 #include "lemonizer/LemonizerOptimization.h"
 #include "lemonizer/LemonizerCode.h"
+#include "lemonizer/LemonizerHelper.h"
+#include "lemonizer/LemonizerStructuring.h"
+#include "lemonizer/TokenTreeConverter.h"
 #include "assembly/CodeOutputHelper.h"
+#include "builder/RomContent.h"
 
-#include <lemon/compiler/TokenProcessing.h>
+#include <lemon/compiler/frontend/TokenProcessing.h>
 #include <lemon/program/Variable.h>
 
 
@@ -19,118 +15,50 @@ namespace lemonizer
 {
 	namespace detail
 	{
-
-		// ----- General helper functions ----- //
-
-		const assembly::AssemblyCode* getAssemblyCode(const Code& code)
+		// Wrapper that points to either a TokenPtr or TokenList entry
+		struct StatementTokenReference
 		{
-			if (code.getType() == Code::ASSEMBLY)
+			StatementTokenReference(lemon::TokenPtr<lemon::StatementToken>& ptr) : mPtr(&ptr) {}
+			StatementTokenReference(lemon::TokenList& list, size_t index) : mList(&list), mIndex(index) {}
+
+			lemon::StatementToken* operator->() const  { return (nullptr != mPtr) ? mPtr->get() : &static_cast<lemon::StatementToken&>((*mList)[mIndex]); }
+
+			void operator=(lemon::StatementToken& token) const
 			{
-				return code.as<CodeAssembly>().mAssemblyCode;
+				if (nullptr != mPtr)
+					(*mPtr) = token;
+				else
+					mList->replace(token, mIndex);
 			}
-			return nullptr;
-		}
 
-		const assembly::AssemblyCode* getAssemblyCode(const Code& code, assembly::CodeType filterType)
-		{
-			const assembly::AssemblyCode* ac = getAssemblyCode(code);
-			return (nullptr != ac && ac->mType == filterType) ? ac : nullptr;
-		}
+		private:
+			lemon::TokenPtr<lemon::StatementToken>* mPtr = nullptr;
+			lemon::TokenList* mList = nullptr;
+			size_t mIndex = 0;
+		};
 
-		bool isSimpleUnconditionalJump(const Code& code, uint32& destinationAddress)
+
+		bool isControlFlowEnd(const Code& code)
 		{
-			// Must be a jump
-			const assembly::AssemblyCode* ac = getAssemblyCode(code, assembly::CodeType::CODE_JUMP);
-			if (nullptr != ac)
+			// Must be an unconditional jump or a return
+			const CodeJumpOrCall* jumpOrCall = code.cast<CodeJumpOrCall>();
+			if (nullptr != jumpOrCall)
 			{
-				// Unconditional jump
-				if (ac->mParamSource.mType != assembly::Parameter::Type::CONDITION)
-				{
-					// Fixed destination address
-					if (ac->mParamDest.mType == assembly::Parameter::Type::CONSTANT)
-					{
-						destinationAddress = ac->mParamDest.mConstant.mValue;
-						return true;
-					}
-				}
+				return !jumpOrCall->mIsCall;
 			}
-			return false;
-		}
 
-		bool isSimpleConditionalJump(const Code& code, uint32& destinationAddress, assembly::Condition& condition, assembly::ExtRegister& loopRegister)
-		{
-			// Must be a jump
-			const assembly::AssemblyCode* ac = getAssemblyCode(code, assembly::CodeType::CODE_JUMP);
-			if (nullptr != ac)
-			{
-				// Conditional jump
-				if (ac->mParamSource.mType == assembly::Parameter::Type::CONDITION)
-				{
-					// Fixed destination address
-					if (ac->mParamDest.mType == assembly::Parameter::Type::CONSTANT)
-					{
-						destinationAddress = ac->mParamDest.mConstant.mValue;
-						condition = ac->mParamSource.mCondition.mCondition;
-						loopRegister = ac->mParamSource.mCondition.mLoopRegister;
-						return true;
-					}
-				}
-			}
-			return false;
-		}
-
-		bool findAddressInBlock(Block& block, uint32 address, bool ignoreEndAddress, size_t& pos)
-		{
-			if (address < block.mEndAddress)
-			{
-				for (size_t i = 0; i < block.size(); ++i)
-				{
-					for (const LineData* line : block[i].mLines)
-					{
-						if (line->mAddress == address)
-						{
-							pos = i;
-							return true;
-						}
-					}
-				}
-			}
-			else if (address == block.mEndAddress && !ignoreEndAddress)
-			{
-				pos = block.size();
+			if (code.isA<CodeReturn>())
 				return true;
-			}
+			if (nullptr != CodeAssembly::getAssemblyCode(code, assembly::CodeType::CODE_RETURN))
+				return true;
+
 			return false;
 		}
 
-		bool containsReturn(Block& block, size_t startPos, size_t endPos)
+		void mergeLinesInto(std::vector<const LineData*>& destination, std::vector<const LineData*>& source, bool atStart = false)
 		{
-			for (size_t i = startPos; i < endPos; ++i)
-			{
-				if (nullptr != getAssemblyCode(block[i], assembly::CodeType::CODE_RETURN))
-				{
-					return true;
-				}
-			}
-			return false;
-		}
-
-		void moveToInnerBlock(Block& block, size_t startPos, size_t endPos, Block& innerBlock)
-		{
-			// Move over codes to the inner block
-			for (size_t i = startPos; i < endPos; ++i)
-			{
-				innerBlock.add(block[i]);
-			}
-
-			// Erase from original block
-			block.erase(startPos, endPos - startPos);
-		}
-
-		void mergeLinesInto(std::vector<const LineData*>& primary, std::vector<const LineData*>& secondary, bool atStart = false)
-		{
-			primary.insert(atStart ? primary.begin() : primary.end(), secondary.begin(), secondary.end());
-			secondary.clear();
+			destination.insert(atStart ? destination.begin() : destination.end(), source.begin(), source.end());
+			source.clear();
 		}
 
 		void mergeLinesInto(std::vector<const LineData*>& output, std::vector<const LineData*>& input1, std::vector<const LineData*>& input2)
@@ -139,559 +67,267 @@ namespace lemonizer
 			mergeLinesInto(output, input2);
 		}
 
-		assembly::DataType getDataTypeForConstant(int32 value)
+		void mergeCodes(Block& block, int pos, int count)
 		{
-			if (value >= 0)
+			RMX_ASSERT(count >= 2, "Count is expected to be at least 2");
+			for (int k = 1; k < count; ++k)
 			{
-				if (value <= 0xff)
-				{
-					return assembly::DataType::u8;
-				}
-				else if (value <= 0xffff)
-				{
-					return assembly::DataType::u16;
-				}
-				else
-				{
-					return assembly::DataType::u32;
-				}
+				mergeLinesInto(block[pos].mLines, block[pos + k].mLines);
 			}
-			else
+			block.erase(pos + 1, count - 1);
+		}
+
+		void mergeCodes(CodeLemonTokenTree& tokenTree, Block& block, int pos, int count)
+		{
+			RMX_ASSERT(count >= 2, "Count is expected to be at least 2");
+			tokenTree.mLines.swap(block[pos].mLines);
+			for (int k = 1; k < count; ++k)
 			{
-				return assembly::DataType::s32;
+				mergeLinesInto(tokenTree.mLines, block[pos + k].mLines);
 			}
+			block.replace(tokenTree, pos);
+			block.erase(pos + 1, count - 1);
+		}
+
+		lemon::UnaryOperationToken* castUnaryOperationToken(lemon::TokenPtr<lemon::StatementToken>& token, lemon::Operator op)
+		{
+			lemon::UnaryOperationToken* assignmentUot = token->cast<lemon::UnaryOperationToken>();
+			if (nullptr == assignmentUot || assignmentUot->mOperator != op)
+				return nullptr;
+			return assignmentUot;
+		}
+
+		lemon::BinaryOperationToken* castBinaryOperationToken(lemon::TokenPtr<lemon::StatementToken>& token, lemon::Operator op)
+		{
+			lemon::BinaryOperationToken* assignmentBot = token->cast<lemon::BinaryOperationToken>();
+			if (nullptr == assignmentBot || assignmentBot->mOperator != op)
+				return nullptr;
+			return assignmentBot;
 		}
 
 		lemon::BinaryOperationToken* castAssignmentToken(lemon::TokenPtr<lemon::StatementToken>& token)
 		{
-			if (token->getType() != lemon::Token::Type::BINARY_OPERATION)
+			return castBinaryOperationToken(token, lemon::Operator::ASSIGN);
+		}
+
+		lemon::BinaryOperationToken* getAssignmentToken(Code& code)
+		{
+			CodeLemonTokenTree* tokenTree = code.cast<CodeLemonTokenTree>();
+			if (nullptr == tokenTree)
 				return nullptr;
-			lemon::BinaryOperationToken& assignmentBot = token->as<lemon::BinaryOperationToken>();
-			if (assignmentBot.mOperator != lemon::Operator::ASSIGN)
-				return nullptr;
-			return &assignmentBot;
+			return castAssignmentToken(tokenTree->mRoot);
 		}
 
-
-
-		// ----- Structure creation ----- //
-
-		// Forward declaration
-		void createStructuredBlocks(Block& block);
-
-		CodeIfElse& replaceWithIfElse(Block& block, uint32 endAddress, size_t startPos, size_t endPos, assembly::Condition condition, assembly::ExtRegister loopRegister = assembly::ExtRegister::NONE)
-		{
-			// Insert new code, replacing the conditional jump
-			std::vector<const LineData*> lineData = std::move(block[startPos].mLines);
-			CodeIfElse& ci = block.createReplaceAt<CodeIfElse>(startPos);
-			ci.mCondition = condition;
-			ci.mLoopRegister = loopRegister;
-			ci.mIfBlock.mEndAddress = endAddress;
-			ci.mLines.swap(lineData);
-
-			// Move conditional code into if-block
-			if (startPos + 1 < endPos)
-			{
-				moveToInnerBlock(block, startPos + 1, endPos, ci.mIfBlock);
-
-				// Recursively handle content
-				createStructuredBlocks(ci.mIfBlock);
-			}
-			return ci;
-		}
-
-		CodeWhile& replaceWithWhile(Block& block, uint32 endAddress, size_t startPos, size_t endPos, assembly::Condition condition, assembly::ExtRegister loopRegister = assembly::ExtRegister::NONE)
-		{
-			// Insert new code just after the jump back
-			CodeWhile& cw = block.createAt<CodeWhile>(endPos);
-			cw.mInnerBlock.mEndAddress = endAddress;
-			cw.mLines = block[endPos - 1].mLines;
-
-			// Move conditional code into inner block
-			if (startPos < endPos)
-			{
-				moveToInnerBlock(block, startPos, endPos, cw.mInnerBlock);
-
-				// Add an if-block at the end
-				std::vector<const LineData*> lineData = std::move(cw.mInnerBlock.back().mLines);
-				CodeIfElse& ci = cw.mInnerBlock.createReplaceAt<CodeIfElse>(cw.mInnerBlock.size() - 1);
-				ci.mIfBlock.mEndAddress = endAddress;
-				ci.mIfBlock.mOutputAsSingleLine = true;
-				ci.mCondition = condition;
-				ci.mLoopRegister = loopRegister;
-				ci.mNegateWholeCondition = true;
-				ci.mLines.swap(lineData);
-
-				// Add inner block for if that consists only of "break"
-				CodeBreakOrContinue& cboc = ci.mIfBlock.createBack<CodeBreakOrContinue>();
-				cboc.mIsContinue = false;
-				cboc.mLines = ci.mLines;
-
-				// Recursively handle while-loop's inner block content
-				createStructuredBlocks(cw.mInnerBlock);
-			}
-			return cw;
-		}
-
-		void createStructuredBlocks(Block& block)
-		{
-			// Create while-blocks where possible
-			for (size_t pos = 0; pos < block.size(); ++pos)
-			{
-				const Code& code = block[pos];
-
-				uint32 destinationAddress;
-				assembly::Condition condition;
-				assembly::ExtRegister loopRegister;
-				if (isSimpleConditionalJump(code, destinationAddress, condition, loopRegister))
-				{
-					// Try to make a while-block, if it's a backward jump
-					if (destinationAddress < code.mLines[0]->mAddress)
-					{
-						const size_t endPos = pos + 1;
-						size_t startPos;
-						if (findAddressInBlock(block, destinationAddress, false, startPos))
-						{
-							if (startPos < endPos && !containsReturn(block, startPos, endPos-1))	// TODO: As an improvement, this could check only for returns that can't be avoided (e.g. by a conditional jump over it)
-							{
-								const uint32 endAddress = (endPos < block.size()) ? block[endPos].mLines.back()->mAddress : block.mEndAddress;
-								replaceWithWhile(block, endAddress, startPos, endPos, condition, loopRegister);
-								continue;
-							}
-						}
-					}
-				}
-			}
-
-			// Create if-blocks where possible
-			for (size_t pos = 0; pos < block.size(); ++pos)
-			{
-				const Code& code = block[pos];
-
-				uint32 destinationAddress;
-				assembly::Condition condition;
-				assembly::ExtRegister loopRegister;
-				if (isSimpleConditionalJump(code, destinationAddress, condition, loopRegister))
-				{
-					const bool hasLoopRegister = (loopRegister != assembly::ExtRegister::NONE);
-
-					// Try to make an if-block, if it's a forward jump
-					if (!hasLoopRegister && destinationAddress > code.mLines[0]->mAddress)
-					{
-						const size_t startPos = pos;
-						size_t endPos;
-						if (findAddressInBlock(block, destinationAddress, false, endPos))
-						{
-							if (endPos > startPos + 1)
-							{
-								const uint32 endAddress = (endPos < block.size()) ? block[endPos].mLines.back()->mAddress : block.mEndAddress;
-								replaceWithIfElse(block, endAddress, startPos, endPos, assembly::negateCondition(condition));
-								continue;
-							}
-						}
-					}
-
-					// Couldn't replace it with a block, so just split into if + jump
-					{
-						if (hasLoopRegister)
-						{
-							condition = assembly::negateCondition(condition);
-						}
-						CodeIfElse& ci = replaceWithIfElse(block, code.mLines.back()->mAddress, pos, pos, condition, loopRegister);
-						CodeJumpOrCall& cj = ci.mIfBlock.create<CodeJumpOrCall>();
-						cj.mIsCall = false;
-						cj.mDestinationAddress = destinationAddress;
-						cj.mLines = ci.mLines;
-					}
-				}
-			}
-
-			// After all if-blocks were inserted, check which could be assigned an else-block as well
-			for (size_t pos = 0; pos < block.size(); ++pos)
-			{
-				Code& code = block[pos];
-				if (code.getType() == Code::IFELSE)
-				{
-					CodeIfElse& ci = code.as<CodeIfElse>();
-
-					// Check for else-block
-					uint32 destinationAddress;
-					if (!ci.mIfBlock.empty() && isSimpleUnconditionalJump(ci.mIfBlock.back(), destinationAddress))
-					{
-						size_t elseEndPos;
-						if (findAddressInBlock(block, destinationAddress, false, elseEndPos))
-						{
-							if (elseEndPos > pos + 1)
-							{
-								ci.mElseBlock.mEndAddress = destinationAddress;
-
-								// Erase unconditional jump just before else
-								ci.mIfBlock.erase(ci.mIfBlock.size() - 1, 1);
-
-								// Move code into else-block
-								moveToInnerBlock(block, pos + 1, elseEndPos, ci.mElseBlock);
-
-								// Recursive structure creation
-								createStructuredBlocks(ci.mElseBlock);
-							}
-						}
-					}
-				}
-			}
-		}
-
-		void collectInnerBlocks(Block& block, std::vector<Block*>& outBlocks)
-		{
-			outBlocks.push_back(&block);
-
-			for (size_t pos = 0; pos < block.size(); ++pos)
-			{
-				if (block[pos].getType() == Code::IFELSE)
-				{
-					CodeIfElse& ci = block[pos].as<CodeIfElse>();
-					collectInnerBlocks(ci.mIfBlock, outBlocks);
-					collectInnerBlocks(ci.mElseBlock, outBlocks);
-				}
-				else if (block[pos].getType() == Code::WHILE)
-				{
-					CodeWhile& cw = block[pos].as<CodeWhile>();
-					collectInnerBlocks(cw.mInnerBlock, outBlocks);
-				}
-			}
-		}
-
-
-
-		// ----- Lemon token tree usage ----- //
-
-		const lemon::DataTypeDefinition* getLemonDataType(const assembly::DataType& dataType)
+		const lemon::DataTypeDefinition* getLemonDataType(const assembly::DataType& dataType, bool isSigned)
 		{
 			switch (dataType.mSize)
 			{
-				case assembly::DataType::Size::SIZE_8:   return dataType.isSigned() ? &lemon::PredefinedDataTypes::INT_8  : &lemon::PredefinedDataTypes::UINT_8;
-				case assembly::DataType::Size::SIZE_16:  return dataType.isSigned() ? &lemon::PredefinedDataTypes::INT_16 : &lemon::PredefinedDataTypes::UINT_16;
-				case assembly::DataType::Size::SIZE_32:  return dataType.isSigned() ? &lemon::PredefinedDataTypes::INT_32 : &lemon::PredefinedDataTypes::UINT_32;
+				case assembly::DataType::Size::SIZE_8:   return isSigned ? &lemon::PredefinedDataTypes::INT_8  : &lemon::PredefinedDataTypes::UINT_8;
+				case assembly::DataType::Size::SIZE_16:  return isSigned ? &lemon::PredefinedDataTypes::INT_16 : &lemon::PredefinedDataTypes::UINT_16;
+				case assembly::DataType::Size::SIZE_32:  return isSigned ? &lemon::PredefinedDataTypes::INT_32 : &lemon::PredefinedDataTypes::UINT_32;
 			}
 			return &lemon::PredefinedDataTypes::UINT_32;
 		}
 
-		void createLemonTokenTreeForParameter(lemon::TokenPtr<lemon::StatementToken>& tokenPtr, const assembly::Parameter& param, const assembly::DataType& dataType)
+		const lemon::DataTypeDefinition* getLemonDataType(const assembly::DataType& dataType)
 		{
-			switch (param.mType)
+			return getLemonDataType(dataType, dataType.isSigned());
+		}
+
+		const lemon::DataTypeDefinition* makeSignedDataType(const lemon::DataTypeDefinition* dataType)
+		{
+			if (dataType == &lemon::PredefinedDataTypes::UINT_8)
+				return &lemon::PredefinedDataTypes::INT_8;
+			else if (dataType == &lemon::PredefinedDataTypes::UINT_16)
+				return &lemon::PredefinedDataTypes::INT_16;
+			else if (dataType == &lemon::PredefinedDataTypes::UINT_32)
+				return &lemon::PredefinedDataTypes::INT_32;
+			else if (dataType == &lemon::PredefinedDataTypes::UINT_64)
+				return &lemon::PredefinedDataTypes::INT_64;
+			else
+				return dataType;
+		}
+
+		void replaceRegisterInTokenTree(const StatementTokenReference& token, assembly::Register reg, assembly::DataType dataType, lemon::ConstantTokenExt& constantToken, bool& outFoundSizeMismatch)
+		{
+			if (lemon::VariableToken* vt = token->cast<lemon::VariableToken>())
 			{
-				case assembly::Parameter::Type::REGISTER:
+				assembly::Register reg1;
+				assembly::DataType dataType1;
+				CodeLemonTokenTree::splitRegisterVariable(vt->mVariable, reg1, dataType1);
+				if (reg == reg1)
 				{
-					if (param.mIsMemory)
+					if (dataType1.getSizeInBytes() <= dataType.getSizeInBytes())
 					{
-						lemon::MemoryAccessToken& memoryAccessToken = tokenPtr.create<lemon::MemoryAccessToken>();
-						memoryAccessToken.mDataType = getLemonDataType(dataType);
-
-						lemon::VariableToken& variableToken = memoryAccessToken.mAddress.create<lemon::VariableToken>();
-						variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(param.mRegister.mRegister, assembly::DataType::u32);
-						variableToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
+						token = constantToken;
 					}
 					else
 					{
-						lemon::VariableToken& variableToken = tokenPtr.create<lemon::VariableToken>();
-						variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(param.mRegister.mRegister, dataType);
-						variableToken.mDataType = getLemonDataType(dataType);
+						outFoundSizeMismatch = true;
 					}
-					break;
 				}
-
-				case assembly::Parameter::Type::CONSTANT:
+			}
+			else if (lemon::BinaryOperationToken* bot = token->cast<lemon::BinaryOperationToken>())
+			{
+				replaceRegisterInTokenTree(StatementTokenReference(bot->mLeft), reg, dataType, constantToken, outFoundSizeMismatch);
+				replaceRegisterInTokenTree(StatementTokenReference(bot->mRight), reg, dataType, constantToken, outFoundSizeMismatch);
+			}
+			else if (lemon::UnaryOperationToken* uot = token->cast<lemon::UnaryOperationToken>())
+			{
+				replaceRegisterInTokenTree(StatementTokenReference(uot->mArgument), reg, dataType, constantToken, outFoundSizeMismatch);
+			}
+			else if (lemon::MemoryAccessToken* mat = token->cast<lemon::MemoryAccessToken>())
+			{
+				replaceRegisterInTokenTree(StatementTokenReference(mat->mAddress), reg, dataType, constantToken, outFoundSizeMismatch);
+			}
+			else if (lemon::ParenthesisToken* pt = token->cast<lemon::ParenthesisToken>())
+			{
+				for (size_t k = 0; k < pt->mContent.size(); ++k)
 				{
-					if (param.mIsMemory)
-					{
-						const uint32 bytes = dataType.getSizeInBytes();
-
-						lemon::MemoryAccessToken& memoryAccessToken = tokenPtr.create<lemon::MemoryAccessToken>();
-						memoryAccessToken.mDataType = getLemonDataType(dataType);
-
-						lemon::ConstantToken& constantToken = memoryAccessToken.mAddress.create<lemon::ConstantToken>();
-						constantToken.mValue = param.mConstant.mValue;
-						constantToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-					}
-					else
-					{
-						lemon::ConstantToken& constantToken = tokenPtr.create<lemon::ConstantToken>();
-						constantToken.mValue = param.mConstant.mValue;
-					}
-					break;
+					replaceRegisterInTokenTree(StatementTokenReference(pt->mContent, k), reg, dataType, constantToken, outFoundSizeMismatch);
 				}
-
-				case assembly::Parameter::Type::COMBINED:
-				{
-					if (param.mIsMemory)
-					{
-						lemon::MemoryAccessToken& memoryAccessToken = tokenPtr.create<lemon::MemoryAccessToken>();
-						memoryAccessToken.mDataType = getLemonDataType(dataType);
-						lemon::TokenPtr<lemon::StatementToken>* currentParent = &memoryAccessToken.mAddress;
-
-						if (param.mCombined.mRegister2 != assembly::ExtRegister::NONE)
-						{
-							// Something with two registers, like "u8[A0 + D0.s16 + 0x18]" instead of just "u8[A0 + 0x18]"
-							lemon::BinaryOperationToken& binaryOperationToken = currentParent->create<lemon::BinaryOperationToken>();
-							binaryOperationToken.mOperator = lemon::Operator::BINARY_PLUS;
-							binaryOperationToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-							currentParent = &binaryOperationToken.mRight;
-
-							lemon::VariableToken& variableToken = binaryOperationToken.mLeft.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable((assembly::Register)param.mCombined.mRegister2, assembly::DataType::u32);
-							variableToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-						}
-
-						if (param.mCombined.mDisplacement == 0)
-						{
-							// Constant is zero
-							//  -> This mostly happens with a second register, e.g. something like "u8[A0 + D0.s16]"
-							const assembly::DataType dataType(param.mCombined.mSizeOfRegister1, param.mCombined.mSizeOfRegister1 == assembly::DataType::Size::SIZE_32 ? assembly::DataType::Sign::UNSIGNED : assembly::DataType::Sign::SIGNED);
-							lemon::VariableToken& variableToken = currentParent->create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(param.mCombined.mRegister1, dataType);
-							variableToken.mDataType = getLemonDataType(dataType);
-						}
-						else if (param.mCombined.mSizeOfRegister1 == assembly::DataType::Size::SIZE_32)
-						{
-							// Something like "u8[A0 + 0x18]"
-							lemon::BinaryOperationToken& binaryOperationToken = currentParent->create<lemon::BinaryOperationToken>();
-							binaryOperationToken.mOperator = lemon::Operator::BINARY_PLUS;
-							binaryOperationToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-
-							lemon::VariableToken& variableToken = binaryOperationToken.mLeft.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(param.mCombined.mRegister1, assembly::DataType::u32);
-							variableToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-
-							lemon::ConstantToken& constantToken = binaryOperationToken.mRight.create<lemon::ConstantToken>();
-							constantToken.mValue = param.mCombined.mDisplacement;
-							if (param.mCombined.mDisplacement < 0)
-							{
-								// Change something in the form "u8[A0 + 0xfffffe80]" to "u8[A0 - 0x180]"
-								binaryOperationToken.mOperator = lemon::Operator::BINARY_MINUS;
-								constantToken.mValue = -param.mCombined.mDisplacement;
-							}
-							constantToken.mDataType = getLemonDataType(getDataTypeForConstant(param.mCombined.mDisplacement));
-						}
-						else if (param.mCombined.mRegister2 != assembly::ExtRegister::NONE)
-						{
-							// Something like "u8[A0 + D0.s16 + 0x18]"
-							lemon::BinaryOperationToken& binaryOperationToken = currentParent->create<lemon::BinaryOperationToken>();
-							binaryOperationToken.mOperator = lemon::Operator::BINARY_PLUS;
-							binaryOperationToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-
-							const assembly::DataType dataType(param.mCombined.mSizeOfRegister1, assembly::DataType::Sign::SIGNED);
-							lemon::VariableToken& variableToken = binaryOperationToken.mLeft.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(param.mCombined.mRegister1, dataType);
-							variableToken.mDataType = getLemonDataType(dataType);
-
-							lemon::ConstantToken& constantToken = binaryOperationToken.mRight.create<lemon::ConstantToken>();
-							constantToken.mValue = param.mCombined.mDisplacement;
-							if (param.mCombined.mDisplacement < 0)
-							{
-								// Change something in the form "u8[A0 + D0.s16 + 0xfffffe80]" to "u8[A0 + D0.s16 - 0x180]"
-								binaryOperationToken.mOperator = lemon::Operator::BINARY_MINUS;
-								constantToken.mValue = -param.mCombined.mDisplacement;
-							}
-							constantToken.mDataType = getLemonDataType(getDataTypeForConstant(param.mCombined.mDisplacement));
-						}
-						else
-						{
-							// Something like "u8[0xffff8000 + D0.s16]"
-							lemon::BinaryOperationToken& binaryOperationToken = currentParent->create<lemon::BinaryOperationToken>();
-							binaryOperationToken.mOperator = lemon::Operator::BINARY_PLUS;
-							binaryOperationToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-
-							lemon::ConstantToken& constantToken = binaryOperationToken.mLeft.create<lemon::ConstantToken>();
-							constantToken.mValue = param.mCombined.mDisplacement;
-							constantToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
-
-							const assembly::DataType dataType(param.mCombined.mSizeOfRegister1, assembly::DataType::Sign::SIGNED);
-							lemon::VariableToken& variableToken = binaryOperationToken.mRight.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(param.mCombined.mRegister1, dataType);
-							variableToken.mDataType = getLemonDataType(dataType);
-						}
-					}
-					else
-					{
-						// TODO: Does this ever happen?
-					}
-					break;
-				}
+			}
+			else if (lemon::ValueCastToken* vct = token->cast<lemon::ValueCastToken>())
+			{
+				replaceRegisterInTokenTree(StatementTokenReference(vct->mArgument), reg, dataType, constantToken, outFoundSizeMismatch);
 			}
 		}
 
-		void tryConvertToTokenTree(Block& block, size_t pos)
-		{
-			const assembly::AssemblyCode* ac = getAssemblyCode(block[pos]);
-			if (nullptr == ac)
-				return;
-
-			const assembly::AssemblyCode& code = *ac;
-			switch (code.mType)
-			{
-				case assembly::CodeType::CODE_CLEAR:
-				{
-					// TODO: Get rid of these restrictions
-					const bool canHandleDest = (code.mParamDest.isPureRegister() && code.mParamDest.mRegister.mPreDecrement == 0 && code.mParamDest.mRegister.mPostIncrement == 0);
-
-					if (canHandleDest && !code.mDataType.isSigned())
-					{
-						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
-						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
-						bot.mOperator = lemon::Operator::ASSIGN;
-
-						if (code.mParamDest.isPureRegister())
-						{
-							lemon::VariableToken& variableToken = bot.mLeft.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(code.mParamDest.mRegister.mRegister, code.mDataType);
-							variableToken.mDataType = getLemonDataType(code.mDataType);
-						}
-
-						createLemonTokenTreeForParameter(bot.mLeft, code.mParamDest, code.mDataType);
-						lemon::ConstantToken& constantToken = bot.mRight.create<lemon::ConstantToken>();
-						constantToken.mValue = 0;
-
-						tokenTree.mLines.swap(block[pos].mLines);
-						block.replace(tokenTree, pos);
-					}
-					break;
-				}
-
-				case assembly::CodeType::CODE_MOVE:
-				{
-					// TODO: Get rid of these restrictions
-					const bool canHandleDest = (code.mParamDest.isPureRegister() && code.mParamDest.mRegister.mPreDecrement == 0 && code.mParamDest.mRegister.mPostIncrement == 0);
-					const bool canHandleSource = (code.mParamSource.isRegister() && code.mParamSource.mRegister.mPreDecrement == 0 && code.mParamSource.mRegister.mPostIncrement == 0) || code.mParamSource.isConstant() || code.mParamSource.isCombinedMemory();
-
-					if (canHandleDest && canHandleSource && !code.mDataType.isSigned())
-					{
-						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
-						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
-						bot.mOperator = lemon::Operator::ASSIGN;
-
-						if (code.mParamDest.isPureRegister())
-						{
-							lemon::VariableToken& variableToken = bot.mLeft.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(code.mParamDest.mRegister.mRegister, code.mDataType);
-							variableToken.mDataType = getLemonDataType(code.mDataType);
-						}
-
-						createLemonTokenTreeForParameter(bot.mLeft, code.mParamDest, code.mDataType);
-						createLemonTokenTreeForParameter(bot.mRight, code.mParamSource, code.mDataType);
-
-						tokenTree.mLines.swap(block[pos].mLines);
-						block.replace(tokenTree, pos);
-					}
-					break;
-				}
-
-				case assembly::CodeType::CODE_ADD:
-				case assembly::CodeType::CODE_SUB:
-				case assembly::CodeType::CODE_MUL:
-					// Do not handle CODE_DIV, as it performs two things at once (divide and modulo)
-				case assembly::CodeType::CODE_AND:
-				case assembly::CodeType::CODE_OR:
-				case assembly::CodeType::CODE_XOR:
-				{
-					// TODO: Get rid of these restrictions
-					const bool canHandleDest = (code.mParamDest.isPureRegister() && code.mParamDest.mRegister.mPreDecrement == 0 && code.mParamDest.mRegister.mPostIncrement == 0);
-					const bool canHandleSource = (code.mParamSource.isRegister() && code.mParamSource.mRegister.mPreDecrement == 0 && code.mParamSource.mRegister.mPostIncrement == 0) || code.mParamSource.isConstant() || code.mParamSource.isCombinedMemory();
-
-					if (canHandleDest && canHandleSource && !code.mDataType.isSigned())
-					{
-						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
-
-						if ((code.mType == assembly::CodeType::CODE_ADD || code.mType == assembly::CodeType::CODE_SUB) &&
-							code.mParamSource.isConstantValue() && code.mParamSource.mConstant.mValue == 1)
-						{
-							// Special handling for +1 and -1
-							lemon::UnaryOperationToken& uot = tokenTree.mRoot.create<lemon::UnaryOperationToken>();
-							uot.mOperator = (code.mType == assembly::CodeType::CODE_SUB) ? lemon::Operator::UNARY_DECREMENT : lemon::Operator::UNARY_INCREMENT;
-							createLemonTokenTreeForParameter(uot.mArgument, code.mParamDest, code.mDataType);
-						}
-						else
-						{
-							lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
-							switch (code.mType)
-							{
-								case assembly::CodeType::CODE_ADD:	bot.mOperator = lemon::Operator::ASSIGN_PLUS;		break;
-								case assembly::CodeType::CODE_SUB:	bot.mOperator = lemon::Operator::ASSIGN_MINUS;		break;
-								case assembly::CodeType::CODE_MUL:	bot.mOperator = lemon::Operator::ASSIGN_MULTIPLY;	break;
-								case assembly::CodeType::CODE_DIV:	bot.mOperator = lemon::Operator::ASSIGN_DIVIDE;		break;
-								case assembly::CodeType::CODE_AND:	bot.mOperator = lemon::Operator::ASSIGN_AND;		break;
-								case assembly::CodeType::CODE_OR:	bot.mOperator = lemon::Operator::ASSIGN_OR;			break;
-								case assembly::CodeType::CODE_XOR:	bot.mOperator = lemon::Operator::ASSIGN_XOR;		break;
-							}
-							createLemonTokenTreeForParameter(bot.mLeft, code.mParamDest, code.mDataType);
-							createLemonTokenTreeForParameter(bot.mRight, code.mParamSource, code.mDataType);
-						}
-
-						tokenTree.mLines.swap(block[pos].mLines);
-						block.replace(tokenTree, pos);
-					}
-					break;
-				}
-
-				case assembly::CodeType::CODE_EXTEND_SIGNED:
-				{
-					// TODO: Get rid of these restrictions
-					const bool canHandleDest = (code.mParamDest.isPureRegister() && code.mParamDest.mRegister.mPreDecrement == 0 && code.mParamDest.mRegister.mPostIncrement == 0);
-
-					if (canHandleDest)
-					{
-						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
-						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
-						bot.mOperator = lemon::Operator::ASSIGN;
-
-						if (code.mParamDest.isPureRegister())
-						{
-							lemon::VariableToken& variableToken = bot.mLeft.create<lemon::VariableToken>();
-							variableToken.mVariable = CodeLemonTokenTree::getRegisterVariable(code.mParamDest.mRegister.mRegister, code.mDataType);
-							variableToken.mDataType = getLemonDataType(code.mDataType);
-						}
-
-						createLemonTokenTreeForParameter(bot.mLeft, code.mParamDest, code.mDataType);
-						createLemonTokenTreeForParameter(bot.mRight, code.mParamDest, assembly::DataType((assembly::DataType::Size)((int)code.mDataType.mSize / 2), assembly::DataType::Sign::SIGNED));
-
-						tokenTree.mLines.swap(block[pos].mLines);
-						block.replace(tokenTree, pos);
-					}
-					break;
-				}
-			}
-		}
 
 		void optimizeBlock(Block& block)
 		{
 			// Merge assignment with sign extension
-			// TODO: Can this be done with lemon token trees instead?
+			//  D0.s8 = ...
+			//  D0.s16 = D0.s8
 			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
 			{
-				const assembly::AssemblyCode* ac1 = getAssemblyCode(block[pos], assembly::CodeType::CODE_MOVE);
-				const assembly::AssemblyCode* ac2 = getAssemblyCode(block[pos + 1], assembly::CodeType::CODE_EXTEND_SIGNED);
+				const assembly::AssemblyCode* ac1 = CodeAssembly::getAssemblyCode(block[pos], assembly::CodeType::CODE_MOVE);
+				const assembly::AssemblyCode* ac2 = CodeAssembly::getAssemblyCode(block[pos + 1], assembly::CodeType::CODE_EXTEND_SIGNED);
 				if (nullptr != ac1 && nullptr != ac2)
 				{
-					if (ac1->mDataType.mSize <= assembly::DataType::Size::SIZE_16 && ac1->mParamDest.isPureRegister() && ac1->mParamSource.isConstantMemory() &&
+					if (ac1->mDataType.mSize <= assembly::DataType::Size::SIZE_16 && ac1->mParamDest.isPureRegister() &&
 						ac2->mDataType.getSizeInBytes() == (ac1->mDataType.getSizeInBytes() * 2) && ac2->mParamDest.isPureRegister(ac1->mParamDest.mRegister.mRegister))
 					{
-						const uint8 bytes = ac1->mDataType.getSizeInBytes();
+						// Check if there's another sign extension afterwards that we can merge as well
+						const assembly::DataType* mergeTwoSignExtensions = nullptr;
+						if (pos + 2 < block.size())
+						{
+							const assembly::AssemblyCode* ac3 = CodeAssembly::getAssemblyCode(block[pos + 2], assembly::CodeType::CODE_EXTEND_SIGNED);
+							if (nullptr != ac3)
+							{
+								if (ac3->mDataType.getSizeInBytes() == (ac1->mDataType.getSizeInBytes() * 4) && ac3->mParamDest.isPureRegister(ac1->mParamDest.mRegister.mRegister))
+								{
+									mergeTwoSignExtensions = &ac3->mDataType;
+								}
+							}
+						}
 
 						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
 						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
 						bot.mOperator = lemon::Operator::ASSIGN;
 
 						lemon::VariableToken& left = bot.mLeft.create<lemon::VariableToken>();
-						left.mVariable = CodeLemonTokenTree::getRegisterVariable(ac1->mParamDest.mRegister.mRegister, ac2->mDataType);
+						const assembly::DataType outputType = (nullptr != mergeTwoSignExtensions) ? *mergeTwoSignExtensions : ac2->mDataType;
+						left.mVariable = CodeLemonTokenTree::getRegisterVariable(ac1->mParamDest.mRegister.mRegister, outputType);
 
-						lemon::MemoryAccessToken& memoryAccessToken = bot.mRight.create<lemon::MemoryAccessToken>();
-						memoryAccessToken.mDataType = getLemonDataType(assembly::DataType(ac1->mDataType.mSize, assembly::DataType::Sign::SIGNED));
+						const assembly::DataType signedDataType(ac1->mDataType.mSize, assembly::DataType::Sign::SIGNED);
+						TokenTreeConverter::createLemonTokenTreeForParameter(bot.mRight, ac1->mParamSource, signedDataType);
 
-						lemon::ConstantToken& constantToken = memoryAccessToken.mAddress.create<lemon::ConstantToken>();
-						constantToken.mValue = ac1->mParamSource.mConstant.mValue;
-						constantToken.mDataType = &lemon::PredefinedDataTypes::UINT_32;
+						mergeCodes(tokenTree, block, (int)pos, (nullptr != mergeTwoSignExtensions) ? 3 : 2);
+					}
+				}
+			}
 
-						mergeLinesInto(tokenTree.mLines, block[pos].mLines, block[pos + 1].mLines);
-						block.replace(tokenTree, pos);
-						block.erase(pos + 1);
+			// Sign two extensions (in case there's no assignment before)
+			//  D0.s16 = D0.s8
+			//  D0.s32 = D0.s16
+			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
+			{
+				const assembly::AssemblyCode* ac1 = CodeAssembly::getAssemblyCode(block[pos], assembly::CodeType::CODE_EXTEND_SIGNED);
+				const assembly::AssemblyCode* ac2 = CodeAssembly::getAssemblyCode(block[pos + 1], assembly::CodeType::CODE_EXTEND_SIGNED);
+				if (nullptr != ac1 && nullptr != ac2)
+				{
+					if (ac1->mDataType.mSize == assembly::DataType::Size::SIZE_16 && ac1->mParamDest.isPureRegister() &&
+						ac2->mDataType.mSize == assembly::DataType::Size::SIZE_32 && ac2->mParamDest.isPureRegister(ac1->mParamDest.mRegister.mRegister))
+					{
+						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
+						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
+						bot.mOperator = lemon::Operator::ASSIGN;
+
+						lemon::VariableToken& left = bot.mLeft.create<lemon::VariableToken>();
+						const assembly::DataType outputType = ac2->mDataType;
+						left.mVariable = CodeLemonTokenTree::getRegisterVariable(ac1->mParamDest.mRegister.mRegister, outputType);
+
+						const assembly::DataType signedDataType(assembly::DataType::Size::SIZE_8, assembly::DataType::Sign::SIGNED);
+						TokenTreeConverter::createLemonTokenTreeForParameter(bot.mRight, ac1->mParamDest, signedDataType);
+
+						mergeCodes(tokenTree, block, (int)pos, 2);
+					}
+				}
+			}
+
+			// Merge word swaps with clear afterwards
+			//  D0 = (D0 << 16) + (D0 >> 16)
+			//  D0.u16 = 0
+			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
+			{
+				const assembly::AssemblyCode* ac1 = CodeAssembly::getAssemblyCode(block[pos], assembly::CodeType::CODE_SWAP_WORDS);
+				const assembly::AssemblyCode* ac2 = CodeAssembly::getAssemblyCode(block[pos + 1], assembly::CodeType::CODE_CLEAR);
+				if (nullptr != ac1 && nullptr != ac2)
+				{
+					if (ac1->mDataType.getSizeInBytes() == 4 && ac1->mParamDest.isPureRegister() &&
+						ac2->mDataType.getSizeInBytes() == 2 && ac2->mParamDest.isPureRegister(ac1->mParamDest.mRegister.mRegister))
+					{
+						// Check if there's an additional word swap afterwards taht can be merged as well
+						if (pos + 2 < block.size())
+						{
+							const assembly::AssemblyCode* ac3 = CodeAssembly::getAssemblyCode(block[pos + 2], assembly::CodeType::CODE_SWAP_WORDS);
+							if (nullptr != ac3 && ac3->mDataType.getSizeInBytes() == 4 && ac3->mParamDest.isPureRegister(ac1->mParamDest.mRegister.mRegister))
+							{
+								CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
+								lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
+								bot.mOperator = lemon::Operator::ASSIGN_AND;
+
+								TokenTreeConverter::createLemonTokenTreeForParameter(bot.mLeft, ac1->mParamDest, ac1->mDataType);
+								TokenTreeConverter::createConstantToken(bot.mRight, 0xffff, &lemon::PredefinedDataTypes::UINT_32);
+
+								mergeCodes(tokenTree, block, (int)pos, 3);
+								continue;
+							}
+						}
+
+						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
+						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
+						bot.mOperator = lemon::Operator::ASSIGN_SHIFT_LEFT;
+
+						TokenTreeConverter::createLemonTokenTreeForParameter(bot.mLeft, ac1->mParamDest, ac1->mDataType);
+						TokenTreeConverter::createConstantToken(bot.mRight, 16, &lemon::PredefinedDataTypes::UINT_32);
+
+						mergeCodes(tokenTree, block, (int)pos, 2);
+					}
+				}
+			}
+
+			// Merge word swaps with clear before
+			//  D0.u16 = 0
+			//  D0 = (D0 << 16) + (D0 >> 16)
+			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
+			{
+				const assembly::AssemblyCode* ac1 = CodeAssembly::getAssemblyCode(block[pos], assembly::CodeType::CODE_CLEAR);
+				const assembly::AssemblyCode* ac2 = CodeAssembly::getAssemblyCode(block[pos + 1], assembly::CodeType::CODE_SWAP_WORDS);
+				if (nullptr != ac1 && nullptr != ac2)
+				{
+					if (ac1->mDataType.getSizeInBytes() == 2 && ac1->mParamDest.isPureRegister() &&
+						ac2->mDataType.getSizeInBytes() == 4 && ac2->mParamDest.isPureRegister(ac1->mParamDest.mRegister.mRegister))
+					{
+						CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
+						lemon::BinaryOperationToken& bot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
+						bot.mOperator = lemon::Operator::ASSIGN_SHIFT_RIGHT;
+
+						TokenTreeConverter::createLemonTokenTreeForParameter(bot.mLeft, ac1->mParamDest, ac2->mDataType);
+						TokenTreeConverter::createConstantToken(bot.mRight, 16, &lemon::PredefinedDataTypes::UINT_32);
+
+						mergeCodes(tokenTree, block, (int)pos, 2);
 					}
 				}
 			}
@@ -699,7 +335,55 @@ namespace lemonizer
 			// Convert codes to token trees
 			for (size_t pos = 0; pos < block.size(); ++pos)
 			{
-				tryConvertToTokenTree(block, pos);
+				TokenTreeConverter::tryConvertToTokenTree(block, pos);
+			}
+
+			// Clean up simple register additions / subtractions
+			//  D0 = D0 + 8
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				lemon::BinaryOperationToken* bot1 = getAssignmentToken(block[pos]);
+				if (nullptr == bot1)
+					continue;
+
+				lemon::BinaryOperationToken* bot2 = bot1->mRight->cast<lemon::BinaryOperationToken>();
+				if (nullptr == bot2)
+					continue;
+				if (bot2->mOperator != lemon::Operator::BINARY_PLUS && bot2->mOperator != lemon::Operator::BINARY_MINUS)
+					continue;
+
+				lemon::VariableToken* var1 = bot1->mLeft->cast<lemon::VariableToken>();
+				lemon::VariableToken* var2 = bot2->mLeft->cast<lemon::VariableToken>();
+				if (nullptr == var1 || nullptr == var2)
+					continue;
+				if (var1->mVariable != var2->mVariable)
+					continue;
+
+				bot1->mOperator = (bot2->mOperator == lemon::Operator::BINARY_PLUS) ? lemon::Operator::ASSIGN_PLUS : lemon::Operator::ASSIGN_MINUS;
+				lemon::TokenPtr<lemon::StatementToken> tmp = bot2->mRight;
+				bot1->mRight = tmp;
+			}
+
+			// Create a zero assignment where subtraction is used to set a register to zero
+			//  D0 -= D0
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				if (!block[pos].isA<CodeLemonTokenTree>())
+					continue;
+
+				lemon::BinaryOperationToken* bot = castBinaryOperationToken(block[pos].as<CodeLemonTokenTree>().mRoot, lemon::Operator::ASSIGN_MINUS);
+				if (nullptr == bot)
+					continue;
+
+				lemon::VariableToken* var1 = bot->mLeft->cast<lemon::VariableToken>();
+				lemon::VariableToken* var2 = bot->mRight->cast<lemon::VariableToken>();
+				if (nullptr == var1 || nullptr == var2)
+					continue;
+				if (var1->mVariable != var2->mVariable)
+					continue;
+
+				bot->mOperator = lemon::Operator::ASSIGN;
+				TokenTreeConverter::createConstantToken(bot->mRight, 0, &lemon::PredefinedDataTypes::UINT_32);
 			}
 
 			// Merge zero assignment to register with additional assignment right after it
@@ -707,17 +391,12 @@ namespace lemonizer
 			//  D0.u16 = ...
 			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
 			{
-				if (block[pos].getType() != Code::LEMONTOKENTREE || block[pos + 1].getType() != Code::LEMONTOKENTREE)
+				lemon::BinaryOperationToken* bot1 = getAssignmentToken(block[pos]);
+				const lemon::BinaryOperationToken* bot2 = getAssignmentToken(block[pos + 1]);
+				if (nullptr == bot1 || nullptr == bot2)
 					continue;
 
-				lemon::TokenPtr<lemon::StatementToken>& root1 = block[pos].as<CodeLemonTokenTree>().mRoot;
-				lemon::TokenPtr<lemon::StatementToken>& root2 = block[pos + 1].as<CodeLemonTokenTree>().mRoot;
-
-				lemon::BinaryOperationToken* bot1 = castAssignmentToken(root1);
-				if (nullptr == bot1)
-					continue;
-
-				if (bot1->mLeft->getType() != lemon::Token::Type::VARIABLE)
+				if (!bot1->mLeft->isA<lemon::VariableToken>())
 					continue;
 				assembly::Register reg1;
 				assembly::DataType dataType1;
@@ -725,16 +404,11 @@ namespace lemonizer
 				if (dataType1.mSize == assembly::DataType::Size::SIZE_8 || dataType1.isSigned())
 					continue;
 
-				if (bot1->mRight->getType() != lemon::Token::Type::CONSTANT)
-					continue;
-				if (bot1->mRight->as<lemon::ConstantToken>().mValue != 0)
-					continue;
-
-				const lemon::BinaryOperationToken* bot2 = castAssignmentToken(root2);
-				if (nullptr == bot2)
+				lemon::ConstantTokenExt* ct = bot1->mRight->cast<lemon::ConstantTokenExt>();
+				if (nullptr == ct || ct->mValue.get<uint64>() != 0)
 					continue;
 
-				if (bot2->mLeft->getType() != lemon::Token::Type::VARIABLE)
+				if (!bot2->mLeft->isA<lemon::VariableToken>())
 					continue;
 				assembly::Register reg2;
 				assembly::DataType dataType2;
@@ -743,33 +417,108 @@ namespace lemonizer
 					continue;
 
 				bot1->mRight = bot2->mRight;
-				
-				mergeLinesInto(block[pos].mLines, block[pos + 1].mLines);
-				block.erase(pos + 1);
+
+				mergeCodes(block, (int)pos, 2);
 			}
 
 			// Form multiplication by two where appropriate
 			for (size_t pos = 0; pos < block.size(); ++pos)
 			{
-				if (block[pos].getType() != Code::LEMONTOKENTREE)
+				if (!block[pos].isA<CodeLemonTokenTree>())
 					continue;
 
 				lemon::TokenPtr<lemon::StatementToken>& root = block[pos].as<CodeLemonTokenTree>().mRoot;
-				if (root->getType() != lemon::Token::Type::BINARY_OPERATION)
+				if (!root->isA<lemon::BinaryOperationToken>())
 					continue;
 				lemon::BinaryOperationToken& bot = root->as<lemon::BinaryOperationToken>();
 				if (bot.mOperator != lemon::Operator::ASSIGN_PLUS)
 					continue;
 
-				if (bot.mLeft->getType() != lemon::Token::Type::VARIABLE || bot.mRight->getType() != lemon::Token::Type::VARIABLE)
+				if (!bot.mLeft->isA<lemon::VariableToken>() || !bot.mRight->isA<lemon::VariableToken>())
 					continue;
 				if (bot.mLeft->as<lemon::VariableToken>().mVariable != bot.mRight->as<lemon::VariableToken>().mVariable)
 					continue;
 
 				bot.mOperator = lemon::Operator::ASSIGN_MULTIPLY;
-				lemon::ConstantToken& constantToken = bot.mRight.create<lemon::ConstantToken>();
-				constantToken.mValue = 2;
-				constantToken.mDataType = &lemon::PredefinedDataTypes::UINT_8;
+				lemon::ConstantTokenExt& ct = TokenTreeConverter::createConstantToken(bot.mRight, 2, &lemon::PredefinedDataTypes::UINT_8);
+				ct.mOutputAsDecimal = true;
+			}
+
+			// Merge assignment and negation
+			//  D0.u16 = ...
+			//  D0.s16 = -D0.s16
+			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
+			{
+				// Both operations must be assignments
+				lemon::BinaryOperationToken* assignmentBot = getAssignmentToken(block[pos]);
+				lemon::BinaryOperationToken* secondBot = getAssignmentToken(block[pos + 1]);
+				if (nullptr == assignmentBot || nullptr == secondBot)
+					continue;
+
+				// Check for negation in the second line
+				lemon::UnaryOperationToken* uot = castUnaryOperationToken(secondBot->mRight, lemon::Operator::BINARY_MINUS);
+				if (nullptr == uot)
+					continue;
+
+				// Target of the first assignment and negated value must both be variables
+				lemon::VariableToken* destVar = assignmentBot->mLeft->cast<lemon::VariableToken>();
+				lemon::VariableToken* sourceVar = uot->mArgument->cast<lemon::VariableToken>();
+				if (nullptr == destVar || nullptr == sourceVar)
+					continue;
+
+				// Both variables must refer to the same register and size, but signs may be different
+				assembly::Register reg1;
+				assembly::DataType dataType1;
+				CodeLemonTokenTree::splitRegisterVariable(destVar->mVariable, reg1, dataType1);
+				assembly::Register reg2;
+				assembly::DataType dataType2;
+				CodeLemonTokenTree::splitRegisterVariable(sourceVar->mVariable, reg2, dataType2);
+				if (reg1 != reg2 || dataType1.mSize != dataType2.mSize)
+					continue;
+
+				// Use the signed version as destination for the output assignment
+				destVar->mVariable = sourceVar->mVariable;
+
+				// Temporarily using the second line's right side to build what is meant to become the first line's right side
+				bool castNeeded = true;
+				if (assignmentBot->mRight->isA<lemon::VariableToken>())
+				{
+					assembly::Register reg3;
+					assembly::DataType dataType3;
+					CodeLemonTokenTree::splitRegisterVariable(assignmentBot->mRight->as<lemon::VariableToken>().mVariable, reg3, dataType3);
+					dataType3.mSign = assembly::DataType::Sign::SIGNED;
+					assignmentBot->mRight->as<lemon::VariableToken>().mVariable = CodeLemonTokenTree::getRegisterVariable(reg3, dataType3);
+					castNeeded = (dataType3.mSize != dataType1.mSize);
+				}
+				else if (assignmentBot->mRight->isA<lemon::MemoryAccessToken>())
+				{
+					const lemon::DataTypeDefinition*& memoryAccessDataType = assignmentBot->mRight->as<lemon::MemoryAccessToken>().mDataType;
+					memoryAccessDataType = makeSignedDataType(memoryAccessDataType);
+					castNeeded = (memoryAccessDataType->getBytes() != dataType1.getSizeInBytes());
+				}
+				else
+				{
+					// This includes the case that it's an identifier (like a define)
+					if (nullptr != assignmentBot->mRight->mDataType && assignmentBot->mRight->mDataType->getClass() == lemon::DataTypeDefinition::Class::INTEGER)
+					{
+						castNeeded = !static_cast<const lemon::IntegerDataType*>(assignmentBot->mRight->mDataType)->mIsSigned;
+					}
+				}
+
+				if (castNeeded)
+				{
+					// Cast needed
+					lemon::ValueCastToken& valueCastToken = uot->mArgument.create<lemon::ValueCastToken>();
+					valueCastToken.mArgument = assignmentBot->mRight;
+					valueCastToken.mDataType = getLemonDataType(dataType2);
+				}
+				else
+				{
+					uot->mArgument = assignmentBot->mRight;
+				}
+				assignmentBot->mRight = uot;
+
+				mergeCodes(block, (int)pos, 2);
 			}
 
 			// Merge assignment and combined assign + operation
@@ -777,91 +526,406 @@ namespace lemonizer
 			//  D0.u16 += ...
 			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
 			{
-				if (block[pos].getType() != Code::LEMONTOKENTREE || block[pos + 1].getType() != Code::LEMONTOKENTREE)
-					continue;
-
-				lemon::TokenPtr<lemon::StatementToken>& root1 = block[pos].as<CodeLemonTokenTree>().mRoot;
-				lemon::TokenPtr<lemon::StatementToken>& root2 = block[pos + 1].as<CodeLemonTokenTree>().mRoot;
-
 				// The operation must be an assignment
-				lemon::BinaryOperationToken* assignmentBot = castAssignmentToken(root1);
+				lemon::BinaryOperationToken* assignmentBot = getAssignmentToken(block[pos]);
 				if (nullptr == assignmentBot)
 					continue;
 
 				// Accept only variables as target for the assignment
-				if (assignmentBot->mLeft->getType() != lemon::Token::Type::VARIABLE)
+				lemon::VariableToken* vt1 = assignmentBot->mLeft->cast<lemon::VariableToken>();
+				if (nullptr == vt1)
 					continue;
 
-				// The second line must be a binary assignment operation
-				if (root2->getType() != lemon::Token::Type::BINARY_OPERATION)
+				if (!block[pos + 1].isA<CodeLemonTokenTree>())
 					continue;
 
-				// Get the second line's binary operation and make sure it uses the same variable as target
-				lemon::BinaryOperationToken& secondBot = root2->as<lemon::BinaryOperationToken>();
-				if (secondBot.mLeft->getType() != lemon::Token::Type::VARIABLE)
-					continue;
-				if (assignmentBot->mLeft->as<lemon::VariableToken>().mVariable != secondBot.mLeft->as<lemon::VariableToken>().mVariable)
-					continue;
+				lemon::TokenPtr<lemon::StatementToken>& root2 = block[pos + 1].as<CodeLemonTokenTree>().mRoot;
 
-				lemon::Operator binaryOperator;
-				switch (secondBot.mOperator)
+				// The second line must be a binary are unary assignment operation
+				if (root2->isA<lemon::BinaryOperationToken>())
 				{
-					case lemon::Operator::ASSIGN_PLUS:			binaryOperator = lemon::Operator::BINARY_PLUS;			break;
-					case lemon::Operator::ASSIGN_MINUS:			binaryOperator = lemon::Operator::BINARY_MINUS;			break;
-					case lemon::Operator::ASSIGN_MULTIPLY:		binaryOperator = lemon::Operator::BINARY_MULTIPLY;		break;
-					case lemon::Operator::ASSIGN_DIVIDE:		binaryOperator = lemon::Operator::BINARY_DIVIDE;		break;
-					case lemon::Operator::ASSIGN_MODULO:		binaryOperator = lemon::Operator::BINARY_MODULO;		break;
-					case lemon::Operator::ASSIGN_SHIFT_LEFT:	binaryOperator = lemon::Operator::BINARY_SHIFT_LEFT;	break;
-					case lemon::Operator::ASSIGN_SHIFT_RIGHT:	binaryOperator = lemon::Operator::BINARY_SHIFT_RIGHT;	break;
-					case lemon::Operator::ASSIGN_AND:			binaryOperator = lemon::Operator::BINARY_AND;			break;
-					case lemon::Operator::ASSIGN_OR:			binaryOperator = lemon::Operator::BINARY_OR;			break;
-					case lemon::Operator::ASSIGN_XOR:			binaryOperator = lemon::Operator::BINARY_XOR;			break;
-					default:
+					// Get the second line's binary operation and make sure it's a variable as well
+					lemon::BinaryOperationToken& secondBot = root2->as<lemon::BinaryOperationToken>();
+					lemon::VariableToken* vt2 = secondBot.mLeft->cast<lemon::VariableToken>();
+					if (nullptr == vt2)
+						continue;
+
+					// If both variables are identical, merging is no problem
+					//  -> Otherwise we allow merging only in certain cases
+					if (vt1->mVariable != vt2->mVariable)
+					{
+						assembly::Register reg1;
+						assembly::DataType dataType1;
+						CodeLemonTokenTree::splitRegisterVariable(vt1->mVariable, reg1, dataType1);
+						assembly::Register reg2;
+						assembly::DataType dataType2;
+						CodeLemonTokenTree::splitRegisterVariable(vt2->mVariable, reg2, dataType2);
+
+						// It needs to be the same register, though different signs might be okay
+						if (reg1 != reg2 || dataType1.mSize != dataType2.mSize)
+							continue;
+
+						if (secondBot.mOperator == lemon::Operator::ASSIGN_PLUS || secondBot.mOperator == lemon::Operator::ASSIGN_MINUS)
+						{
+							// Allow additions and subtractions even if signedness differs, but ensure the right side is casted properly
+							if (nullptr == assignmentBot->mRight->mDataType || assignmentBot->mRight->mDataType->getBytes() != dataType1.getSizeInBytes())
+							{
+								lemon::TokenPtr<lemon::StatementToken> tmp = assignmentBot->mRight;
+								lemon::ValueCastToken& vct = assignmentBot->mRight.create<lemon::ValueCastToken>();
+								vct.mArgument = tmp;
+								vct.mDataType = getLemonDataType(dataType1);
+							}
+						}
+						else if (secondBot.mOperator == lemon::Operator::ASSIGN_SHIFT_LEFT || secondBot.mOperator == lemon::Operator::ASSIGN_SHIFT_RIGHT)
+						{
+							// The right side of the first assignment must match the size of the register
+							if (nullptr == assignmentBot->mRight->mDataType || assignmentBot->mRight->mDataType->getBytes() != dataType1.getSizeInBytes())
+								continue;
+
+							// The right side of the first assignment must also be a register
+							lemon::VariableToken* vt3 = assignmentBot->mRight->cast<lemon::VariableToken>();
+							if (nullptr == vt3)
+								continue;
+
+							// Change the signedness of both registers to fit
+							dataType1 = dataType2;
+							vt1->mVariable = CodeLemonTokenTree::getRegisterVariable(reg1, dataType1);
+
+							assembly::Register reg3;
+							assembly::DataType dataType3;
+							CodeLemonTokenTree::splitRegisterVariable(vt3->mVariable, reg3, dataType3);
+							dataType3 = dataType2;
+							vt3->mVariable = CodeLemonTokenTree::getRegisterVariable(reg3, dataType3);
+						}
+						else
+						{
+							// TODO: We could possibly allow subtractions and others as well
+							continue;
+						}
+					}
+
+					const lemon::Operator binaryOperator = lemon::OperatorHelper::getBinaryForAssign(secondBot.mOperator);
+					if (binaryOperator == lemon::Operator::_INVALID)
+						continue;
+
+					const bool needsParentheses = TokenTreeConverter::needsParentheses(assignmentBot->mRight, binaryOperator, true);
+
+					// Replace the second line's operator, removing the assigment part (and potentially adding parentheses)
+					secondBot.mOperator = binaryOperator;
+					if (needsParentheses)
+					{
+						lemon::ParenthesisToken& pt = secondBot.mLeft.create<lemon::ParenthesisToken>();
+						pt.mContent.add(*assignmentBot->mRight);
+						pt.mParenthesisType = lemon::ParenthesisType::PARENTHESIS;
+						pt.mDataType = assignmentBot->mDataType;
+					}
+					else
+					{
+						secondBot.mLeft = assignmentBot->mRight;
+					}
+					assignmentBot->mRight = secondBot;
+
+					mergeCodes(block, (int)pos, 2);
+					--pos;		// Check again at the same position
+				}
+				else if (root2->isA<lemon::UnaryOperationToken>())
+				{
+					// Get the second line's binary operation and make sure it's a variable as well
+					lemon::UnaryOperationToken& secondUot = root2->as<lemon::UnaryOperationToken>();
+					lemon::VariableToken* vt2 = secondUot.mArgument->cast<lemon::VariableToken>();
+					if (nullptr == vt2)
+						continue;
+
+					lemon::Operator binaryOperator = lemon::Operator::_INVALID;
+					switch (secondUot.mOperator)
+					{
+						// Currently supporting only increment and decrement
+						case lemon::Operator::UNARY_DECREMENT:  binaryOperator = lemon::Operator::BINARY_MINUS;  break;
+						case lemon::Operator::UNARY_INCREMENT:  binaryOperator = lemon::Operator::BINARY_PLUS;  break;
+						default:
+							break;
+					}
+					if (binaryOperator == lemon::Operator::_INVALID)
+						continue;
+
+					// If both variables are identical, merging is no problem
+					//  -> Otherwise we allow merging only in certain cases
+					if (vt1->mVariable != vt2->mVariable)
+					{
+						assembly::Register reg1;
+						assembly::DataType dataType1;
+						CodeLemonTokenTree::splitRegisterVariable(vt1->mVariable, reg1, dataType1);
+						assembly::Register reg2;
+						assembly::DataType dataType2;
+						CodeLemonTokenTree::splitRegisterVariable(vt2->mVariable, reg2, dataType2);
+
+						// It needs to be the same register, though different signs might be okay
+						if (reg1 != reg2 || dataType1.mSize != dataType2.mSize)
+							continue;
+					}
+
+					const bool needsParentheses = TokenTreeConverter::needsParentheses(assignmentBot->mRight, binaryOperator, true);
+
+					lemon::TokenPtr<lemon::StatementToken> newValuePtr;
+					lemon::BinaryOperationToken& newBot = newValuePtr.create<lemon::BinaryOperationToken>();
+					newBot.mDataType = secondUot.mDataType;
+					newBot.mOperator = binaryOperator;
+
+					if (needsParentheses)
+					{
+						lemon::ParenthesisToken& pt = newBot.mLeft.create<lemon::ParenthesisToken>();
+						pt.mParenthesisType = lemon::ParenthesisType::PARENTHESIS;
+						pt.mDataType = assignmentBot->mDataType;
+						pt.mContent.add(*assignmentBot->mRight);
+					}
+					else
+					{
+						newBot.mLeft = assignmentBot->mRight;
+					}
+
+					lemon::ConstantTokenExt& ct = TokenTreeConverter::createConstantToken(newBot.mRight, 1, newBot.mDataType);
+					ct.mOutputAsDecimal = true;
+
+					assignmentBot->mRight = newValuePtr;
+
+					mergeCodes(block, (int)pos, 2);
+					--pos;		// Check again at the same position
+				}
+			}
+
+			// For "A7 += x", update data type for x if it is below 10 to enforce decimal output
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				if (!block[pos].isA<CodeLemonTokenTree>())
+					continue;
+
+				lemon::TokenPtr<lemon::StatementToken>& root = block[pos].as<CodeLemonTokenTree>().mRoot;
+				lemon::BinaryOperationToken* bot = castBinaryOperationToken(root, lemon::Operator::ASSIGN_PLUS);
+				if (nullptr == bot)
+				{
+					bot = castBinaryOperationToken(root, lemon::Operator::ASSIGN_MINUS);
+					if (nullptr == bot)
 						continue;
 				}
 
-				bool needsParentheses = false;
-				if (assignmentBot->mRight->getType() == lemon::Token::Type::BINARY_OPERATION)
-				{
-					const uint8 prio1 = lemon::TokenProcessing::getOperatorPriority(assignmentBot->mRight->as<lemon::BinaryOperationToken>().mOperator);
-					const uint8 prio2 = lemon::TokenProcessing::getOperatorPriority(secondBot.mOperator);
+				lemon::VariableToken* vt = bot->mLeft->cast<lemon::VariableToken>();
+				if (nullptr == vt)
+					continue;
 
-					// Lower values mean higher priority here, so this actually means that we need parentheses if the right side has a higher priority
-					needsParentheses = (prio1 > prio2);
-				}
+				assembly::Register reg;
+				assembly::DataType dataType;
+				CodeLemonTokenTree::splitRegisterVariable(vt->mVariable, reg, dataType);
+				if (reg != assembly::Register::A7)
+					continue;
 
-				// Replace the second line's operator, removing the assigment part (and potentially adding parentheses)
-				secondBot.mOperator = binaryOperator;
-				if (needsParentheses)
-				{
-					lemon::ParenthesisToken& pt = secondBot.mLeft.create<lemon::ParenthesisToken>();
-					pt.mContent.add(*assignmentBot->mRight);
-					pt.mParenthesisType = lemon::ParenthesisType::PARENTHESIS;
-					pt.mDataType = assignmentBot->mDataType;
-				}
-				else
-				{
-					secondBot.mLeft = assignmentBot->mRight;
-				}
-				assignmentBot->mRight = secondBot;
+				if (!bot->mRight->isA<lemon::ConstantTokenExt>())
+					continue;
 
-				mergeLinesInto(block[pos].mLines, block[pos + 1].mLines);
-				block.erase(pos + 1);
-				--pos;		// Check again at the same position
+				lemon::ConstantTokenExt& ct = bot->mRight->as<lemon::ConstantTokenExt>();
+				if (nullptr != ct.mDataType || ct.mValue.get<uint64>() >= 10)
+					continue;
+
+				ct.mDataType = &lemon::PredefinedDataTypes::UINT_8;
 			}
 
-			// TODO: Add more
+			// When a register is assigned a constant, try to replace its following appearances directly with the constant
+			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
+			{
+				// The operation must be an assignment
+				lemon::BinaryOperationToken* assignmentBot = getAssignmentToken(block[pos]);
+				if (nullptr == assignmentBot)
+					continue;
+
+				// Accept only variables as target for the assignment
+				lemon::VariableToken* vt1 = assignmentBot->mLeft->cast<lemon::VariableToken>();
+				if (nullptr == vt1)
+					continue;
+
+				// Right side must be a constant
+				lemon::ConstantTokenExt* ct = assignmentBot->mRight->cast<lemon::ConstantTokenExt>();
+				if (nullptr == ct)
+					continue;
+
+				assembly::Register reg1;
+				assembly::DataType dataType1;
+				CodeLemonTokenTree::splitRegisterVariable(vt1->mVariable, reg1, dataType1);
+
+				// Check the next codes
+				bool isEventuallyOverwritten = false;
+				bool foundAnySizeMismatch = false;
+				for (size_t k = pos + 1; k < block.size(); ++k)
+				{
+					CodeLemonTokenTree* lemonTree2 = block[k].cast<CodeLemonTokenTree>();
+					if (nullptr == lemonTree2)
+						break;
+
+					// There must not be a label in between
+					bool anyLabel = false;
+					for (const LineData* lineData : lemonTree2->mLines)
+					{
+						anyLabel |= lineData->mIsLabel;
+					}
+					if (anyLabel)
+						break;
+
+					// The operation must be a binary operation
+					lemon::BinaryOperationToken* bot2 = lemonTree2->mRoot->cast<lemon::BinaryOperationToken>();
+					if (nullptr == bot2)
+						break;
+
+					// Check if the register appears as target of the assignment
+					bool isTarget = false;
+					bool isCorrectSize = false;
+					{
+						lemon::VariableToken* vt2 = bot2->mLeft->cast<lemon::VariableToken>();
+						if (nullptr != vt2)
+						{
+							assembly::Register reg2;
+							assembly::DataType dataType2;
+							CodeLemonTokenTree::splitRegisterVariable(vt2->mVariable, reg2, dataType2);
+
+							if (reg1 == reg2)
+							{
+								isTarget = true;
+								isEventuallyOverwritten = (dataType2.getSizeInBytes() >= dataType1.getSizeInBytes());
+								isCorrectSize = (dataType2.getSizeInBytes() == dataType1.getSizeInBytes());
+								foundAnySizeMismatch |= !isCorrectSize;
+							}
+						}
+					}
+
+					// Check if left side is the searched register and it's a combined assignment and binary operation
+					if (isTarget && isCorrectSize && bot2->mOperator != lemon::Operator::ASSIGN &&
+						(lemon::OperatorHelper::getOperatorType(bot2->mOperator) == lemon::OperatorHelper::OperatorType::ASSIGNMENT || lemon::OperatorHelper::getOperatorType(bot2->mOperator) == lemon::OperatorHelper::OperatorType::ASSIGNMENT_INT))
+					{
+						// Resolve assignment with binary operation, i.e. resolve something like "A0 += 4" to "A0 = A0 + 4"
+						TokenTreeConverter::resolveBinaryToPureAssignment(*bot2);
+					}
+
+					// Search occurences of the register that can be replaced by the constant, and perform the actual replacement
+					replaceRegisterInTokenTree(StatementTokenReference(bot2->mRight), reg1, dataType1, *ct, foundAnySizeMismatch);
+
+					// Abort if the register is the target of the assignment
+					if (isTarget)
+						break;
+
+					// Try to replace on the left side as well, in case it's a memory access like "u8[A2] = ..."
+					replaceRegisterInTokenTree(StatementTokenReference(bot2->mLeft), reg1, dataType1, *ct, foundAnySizeMismatch);
+				}
+
+				if (isEventuallyOverwritten && !foundAnySizeMismatch)
+				{
+					// Merge into the next line
+					mergeLinesInto(block[pos + 1].mLines, block[pos].mLines, true);
+					block.erase(pos);
+					--pos;
+				}
+			}
+
+			// Build trinary operations from if-else where possible
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				CodeIfElse* ci = block[pos].cast<CodeIfElse>();
+				if (nullptr == ci || !ci->mConditionRoot.valid() || ci->mIfBlock.size() != 1 || ci->mElseBlock.size() != 1)
+					continue;
+
+				// Both if and else block content must be a single assignment
+				lemon::BinaryOperationToken* assignmentBot1 = getAssignmentToken(ci->mIfBlock[0]);
+				lemon::BinaryOperationToken* assignmentBot2 = getAssignmentToken(ci->mElseBlock[0]);
+				if (nullptr == assignmentBot1 || nullptr == assignmentBot2)
+					continue;
+
+				// Accept only variables as target for the assignments
+				lemon::VariableToken* vt1 = assignmentBot1->mLeft->cast<lemon::VariableToken>();
+				lemon::VariableToken* vt2 = assignmentBot2->mLeft->cast<lemon::VariableToken>();
+				if (nullptr == vt1 || nullptr == vt2)
+					continue;
+
+				// Both variables must refer to the same register and size, but signs may be different
+				assembly::Register reg1;
+				assembly::DataType dataType1;
+				CodeLemonTokenTree::splitRegisterVariable(vt1->mVariable, reg1, dataType1);
+				assembly::Register reg2;
+				assembly::DataType dataType2;
+				CodeLemonTokenTree::splitRegisterVariable(vt2->mVariable, reg2, dataType2);
+				if (reg1 != reg2 || dataType1.mSize != dataType2.mSize)
+					continue;
+
+				// Right sides must both be constants
+				lemon::ConstantTokenExt* ct1 = assignmentBot1->mRight->cast<lemon::ConstantTokenExt>();
+				lemon::ConstantTokenExt* ct2 = assignmentBot2->mRight->cast<lemon::ConstantTokenExt>();
+				if (nullptr == ct1 || nullptr == ct2)
+					continue;
+
+				CodeLemonTokenTree& tokenTree = genericmanager::Manager<Code>::create<CodeLemonTokenTree>();
+				lemon::BinaryOperationToken& newAssignmentBot = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
+				newAssignmentBot.mDataType = assignmentBot1->mDataType;
+				newAssignmentBot.mOperator = lemon::Operator::ASSIGN;
+				newAssignmentBot.mLeft = assignmentBot1->mLeft;
+
+				lemon::BinaryOperationToken& trinaryA = newAssignmentBot.mRight.create<lemon::BinaryOperationToken>();
+				trinaryA.mDataType = assignmentBot1->mDataType;
+				trinaryA.mOperator = lemon::Operator::QUESTIONMARK;
+
+				lemon::ParenthesisToken& pt = trinaryA.mLeft.create<lemon::ParenthesisToken>();
+				pt.mParenthesisType = lemon::ParenthesisType::PARENTHESIS;
+				pt.mDataType = assignmentBot1->mDataType;
+				pt.mContent.add(*ci->mConditionRoot);
+
+				lemon::BinaryOperationToken& trinaryB = trinaryA.mRight.create<lemon::BinaryOperationToken>();
+				trinaryB.mDataType = assignmentBot1->mDataType;
+				trinaryB.mOperator = lemon::Operator::COLON;
+				trinaryB.mLeft = ct1;
+				trinaryB.mRight = ct2;
+
+				std::swap(tokenTree.mLines, ci->mLines);
+				mergeLinesInto(tokenTree.mLines, ci->mIfBlock[0].mLines);
+				mergeLinesInto(tokenTree.mLines, ci->mElseBlock[0].mLines);
+
+				block.replace(tokenTree, pos);
+			}
+
+			// Replace unconditional jumps that just lead to a return with the return itself
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				CodeJumpOrCall* code = block[pos].cast<CodeJumpOrCall>();
+				if (nullptr == code || code->mIsCall)
+					continue;
+
+				const RomContent::Instruction* instruction = RomContent::instance().getInstructionByAddress(code->mDestinationAddress);
+				if (nullptr == instruction || (instruction->mFlags & RomContent::InstructionFlag::RETURN) == 0)
+					continue;
+
+				CodePtr<CodeReturn> newCodePtr;
+				newCodePtr.create<CodeReturn>();
+				std::swap(newCodePtr->mLines, code->mLines);
+				block.replace(*newCodePtr, pos);
+			}
 		}
 
 		void postprocessIfBlocks(Block& block, const assembly::AssemblyCode* formerAssemblyCode)
 		{
+			// Convert remaining jump assembly codes to CodeJumpOrCall
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				uint32 destinationAddress = 0;
+				if (Helper::isSimpleUnconditionalJump(block[pos], destinationAddress))
+				{
+					std::vector<const LineData*> lineData = std::move(block[pos].mLines);
+
+					CodeJumpOrCall& cj = block.createReplaceAt<CodeJumpOrCall>(pos);
+					cj.mIsCall = false;
+					cj.mDestinationAddress = destinationAddress;
+					cj.mLines = std::move(lineData);
+				}
+			}
+
 			// Refine if-block conditions where possible
 			for (size_t pos = 0; pos < block.size(); ++pos)
 			{
-				if (block[pos].getType() == Code::IFELSE)
+				CodeIfElse* ci = block[pos].cast<CodeIfElse>();
+				if (nullptr != ci)
 				{
-					CodeIfElse& ci = block[pos].as<CodeIfElse>();
-
 					const assembly::AssemblyCode* lastAssemblyCode = nullptr;
 					bool mergeAllowed = false;
 					if (pos == 0)
@@ -874,15 +938,20 @@ namespace lemonizer
 						const Code& formerCode = block[pos-1];
 
 						// Have a look at assembly code just before this if-block
-						if (formerCode.getType() == Code::ASSEMBLY)
+						if (formerCode.isA<CodeAssembly>())
 						{
 							lastAssemblyCode = formerCode.as<CodeAssembly>().mAssemblyCode;
 							mergeAllowed = true;	// If it is the right type of assembly code, we may remove it afterwards
 						}
 						// Is former code just another if-code?
-						else if (formerCode.getType() == Code::IFELSE)
+						else if (formerCode.isA<CodeIfElse>())
 						{
-							lastAssemblyCode = formerCode.as<CodeIfElse>().mAssemblyCode;
+							// Only allow it if both branches are either empty or end with an unconditional jump, otherwise there's a risk any of the block's content actually changes the condition
+							if ((formerCode.as<CodeIfElse>().mIfBlock.empty() || isControlFlowEnd(formerCode.as<CodeIfElse>().mIfBlock.back())) &&
+								(formerCode.as<CodeIfElse>().mElseBlock.empty() || isControlFlowEnd(formerCode.as<CodeIfElse>().mElseBlock.back())))
+							{
+								lastAssemblyCode = formerCode.as<CodeIfElse>().mConditionAssemblyCode;
+							}
 						}
 					}
 
@@ -894,7 +963,7 @@ namespace lemonizer
 							case assembly::CodeType::CODE_TEST:
 							case assembly::CodeType::CODE_TEST_BIT:
 							{
-								ci.mAssemblyCode = lastAssemblyCode;
+								ci->mConditionAssemblyCode = lastAssemblyCode;
 
 								// Merge with last code -- only allowed if it is actually inside the same block
 								if (mergeAllowed)
@@ -906,25 +975,111 @@ namespace lemonizer
 								break;
 							}
 
-							case assembly::CodeType::CODE_MOVE:
-							case assembly::CodeType::CODE_ADD:
-							case assembly::CodeType::CODE_SUB:
-							case assembly::CodeType::CODE_AND:
-							case assembly::CodeType::CODE_OR:
-							case assembly::CodeType::CODE_SHIFT_LEFT:
-							case assembly::CodeType::CODE_SHIFT_RIGHT:		// TODO: Add more?
-							case assembly::CodeType::CODE_EXTEND_SIGNED:
+							case assembly::CodeType::CODE_SET_BIT:
+							case assembly::CodeType::CODE_CLEAR_BIT:
 							{
-								ci.mAssemblyCode = lastAssemblyCode;
+								ci->mConditionAssemblyCode = lastAssemblyCode;
+
+								if (ci->mCondition == assembly::Condition::EQ || ci->mCondition == assembly::Condition::NE)
+								{
+									if (pos >= 1 && lastAssemblyCode == block[pos-1].as<CodeAssembly>().mAssemblyCode)
+									{
+										// We can move the bit manipulation into the if- or else-part to simplify the code there
+										if ((lastAssemblyCode->mType == assembly::CodeType::CODE_SET_BIT) == (ci->mCondition == assembly::Condition::EQ))
+										{
+											ci->mIfBlock.insert(block[pos-1], 0);
+										}
+										else
+										{
+											// Check for the special case that there's no else-block yet and the if-block is just an unconditional jump or a return
+											//  -> In this case, there's no need to create an else-block at all
+											if (ci->mElseBlock.empty() && ci->mIfBlock.size() == 1 && ci->mIfBlock[0].isA<CodeJumpOrCall>())
+											{
+												block.insert(block[pos-1], pos+1);
+											}
+											else
+											{
+												ci->mElseBlock.insert(block[pos-1], 0);
+
+												if (nullptr != block[pos-1].mLines[0])
+													const_cast<LineData*>(block[pos-1].mLines[0])->mIsOutOfOrder = true;
+											}
+										}
+
+										block.erase(pos-1);
+										--pos;
+										break;
+									}
+								}
+
+								// Let the code generator add something like "bool _condition012345 = D0 & 0x80" in front
+								const_cast<assembly::AssemblyCode*>(lastAssemblyCode)->mCodeGenData = ci->mLines[0]->mAddress;
 								break;
 							}
+
+							case assembly::CodeType::CODE_SUB:
+							{
+								ci->mConditionAssemblyCode = lastAssemblyCode;
+
+								// Experimental code while trying to resolve some "carryFlag()" conditions
+								//  -> However, this leads to very ugly code, as the condition bool setter often needs to be inserted between multiple operations that can otherwise be merged into one line
+							#if 0
+								if (ci->mCondition == assembly::Condition::CC || ci->mCondition == assembly::Condition::CS)
+								{
+									if (pos >= 1 && lastAssemblyCode == block[pos-1].as<CodeAssembly>().mConditionAssemblyCode)
+									{
+										CodeLemonTokenTree& tokenTree = block.createAt<CodeLemonTokenTree>(pos - 1);
+										tokenTree.mLines = ci->mLines;
+
+										lemon::BinaryOperationToken& assignment = tokenTree.mRoot.create<lemon::BinaryOperationToken>();
+										assignment.mOperator = lemon::Operator::ASSIGN;
+
+										lemon::IdentifierToken& conditionIdentifier = assignment.mLeft.create<lemon::IdentifierToken>();
+										conditionIdentifier.mName = "_condition" + rmx::hexString(ci->mLines[0]->mAddress, 6, "");
+										conditionIdentifier.mDataType = &lemon::PredefinedDataTypes::BOOL;
+
+										lemon::BinaryOperationToken& comparison = assignment.mRight.create<lemon::BinaryOperationToken>();
+										comparison.mOperator = lemon::Operator::COMPARE_LESS;
+
+										TokenTreeConverter::createLemonTokenTreeForParameter(comparison.mLeft, lastAssemblyCode->mParamDest, lastAssemblyCode->mDataType);
+										TokenTreeConverter::createLemonTokenTreeForParameter(comparison.mRight, lastAssemblyCode->mParamSource, lastAssemblyCode->mDataType);
+
+										//const_cast<assembly::AssemblyCode*>(lastAssemblyCode)->mCodeGenData = ci->mLines[0]->mAddress;
+
+										++pos;
+									}
+								}
+							#endif
+								break;
+							}
+
+							case assembly::CodeType::CODE_MOVE:
+							case assembly::CodeType::CODE_ADD:
+							case assembly::CodeType::CODE_NOT:
+							case assembly::CodeType::CODE_AND:
+							case assembly::CodeType::CODE_OR:
+							case assembly::CodeType::CODE_XOR:
+							case assembly::CodeType::CODE_SHIFT_LEFT:
+							case assembly::CodeType::CODE_SHIFT_RIGHT:
+							case assembly::CodeType::CODE_EXTEND_SIGNED:
+							{
+								ci->mConditionAssemblyCode = lastAssemblyCode;
+								break;
+							}
+						}
+
+						if (nullptr != ci->mConditionAssemblyCode && ci->mLoopRegister == assembly::ExtRegister::NONE)
+						{
+							// Convert assembly code to a lemon token tree
+							const assembly::Condition condition = ci->mNegateWholeCondition ? assembly::negateCondition(ci->mCondition) : ci->mCondition;
+							TokenTreeConverter::createTokenTreeForCondition(ci->mConditionRoot, condition, *ci->mConditionAssemblyCode);
 						}
 					}
 
 					// Go deeper
 					//  -> It's important to do this after we fully processed the current if-code
-					postprocessIfBlocks(ci.mIfBlock, ci.mAssemblyCode);
-					postprocessIfBlocks(ci.mElseBlock, ci.mAssemblyCode);
+					postprocessIfBlocks(ci->mIfBlock, ci->mConditionAssemblyCode);
+					postprocessIfBlocks(ci->mElseBlock, ci->mConditionAssemblyCode);
 				}
 				else if (block[pos].getType() == Code::WHILE)
 				{
@@ -934,24 +1089,143 @@ namespace lemonizer
 					postprocessIfBlocks(cw.mInnerBlock, nullptr);
 				}
 			}
+
+			// Check for nested if-blocks that can be combined with &&
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				CodeIfElse* ci1 = block[pos].cast<CodeIfElse>();
+				if (nullptr == ci1 || !ci1->mConditionRoot.valid() || ci1->mIfBlock.size() != 1 || !ci1->mElseBlock.empty())
+					continue;
+
+				CodeIfElse* ci2 = ci1->mIfBlock[0].cast<CodeIfElse>();
+				if (nullptr == ci2 || !ci2->mConditionRoot.valid() || !ci2->mElseBlock.empty())
+					continue;
+
+				// Merge the conditions
+				lemon::TokenPtr<lemon::StatementToken> newCondition;
+				lemon::BinaryOperationToken& bot = newCondition.create<lemon::BinaryOperationToken>();
+				bot.mOperator = lemon::Operator::LOGICAL_AND;
+				bot.mDataType = &lemon::PredefinedDataTypes::BOOL;
+
+				const bool needsParentheses1 = TokenTreeConverter::needsParentheses(ci1->mConditionRoot, bot.mOperator, false);
+				const bool needsParentheses2 = TokenTreeConverter::needsParentheses(ci2->mConditionRoot, bot.mOperator, true);
+
+				TokenTreeConverter::putWithOptionalParenthesis(bot.mLeft, *ci1->mConditionRoot, needsParentheses1);
+				TokenTreeConverter::putWithOptionalParenthesis(bot.mRight, *ci2->mConditionRoot, needsParentheses2);
+
+				ci1->mConditionRoot = newCondition;
+
+				// Move the content of the inner if-block into the other if-block
+				Block* parentBlock = ci1->mIfBlock.mParentBlock;
+				const uint32 endAddress = ci1->mIfBlock.mEndAddress;
+				const uint32 breakTargetAddress = ci1->mIfBlock.mBreakTargetAddress;
+
+				mergeLinesInto(ci1->mLines, ci2->mLines);
+
+				Block tmp = std::move(ci2->mIfBlock);
+				ci1->mIfBlock = std::move(tmp);
+				ci1->mIfBlock.mParentBlock = parentBlock;
+				ci1->mIfBlock.mEndAddress = endAddress;
+				ci1->mIfBlock.mBreakTargetAddress = breakTargetAddress;
+			}
+
+			// Check for an immediate inner if that's just a jump right to the else-block, to merge into one if-block combining both conditions using &&
+			for (size_t pos = 0; pos < block.size(); ++pos)
+			{
+				CodeIfElse* ci1 = block[pos].cast<CodeIfElse>();
+				if (nullptr == ci1 || !ci1->mConditionRoot.valid() || ci1->mIfBlock.empty() || ci1->mElseBlock.empty())
+					continue;
+
+				CodeIfElse* ci2 = ci1->mIfBlock[0].cast<CodeIfElse>();
+				if (nullptr == ci2 || !ci2->mConditionRoot.valid() || ci2->mIfBlock.size() != 1 || !ci2->mElseBlock.empty())
+					continue;
+
+				const CodeJumpOrCall* jumpCode = ci2->mIfBlock[0].cast<CodeJumpOrCall>();
+				if (nullptr == jumpCode || jumpCode->mIsCall)
+					continue;
+				if (jumpCode->mDestinationAddress != ci1->mElseBlock[0].mLines[0]->mAddress)
+					continue;
+
+				// Inner condition needs to be negated
+				if (!TokenTreeConverter::negateCondition(*ci2->mConditionRoot))
+					continue;
+
+				// Merge the conditions
+				lemon::TokenPtr<lemon::StatementToken> newCondition;
+				lemon::BinaryOperationToken& bot = newCondition.create<lemon::BinaryOperationToken>();
+				bot.mOperator = lemon::Operator::LOGICAL_AND;
+				bot.mDataType = &lemon::PredefinedDataTypes::BOOL;
+
+				const bool needsParentheses1 = TokenTreeConverter::needsParentheses(ci1->mConditionRoot, bot.mOperator, false);
+				const bool needsParentheses2 = TokenTreeConverter::needsParentheses(ci2->mConditionRoot, bot.mOperator, true);
+
+				TokenTreeConverter::putWithOptionalParenthesis(bot.mLeft, *ci1->mConditionRoot, needsParentheses1);
+				TokenTreeConverter::putWithOptionalParenthesis(bot.mRight, *ci2->mConditionRoot, needsParentheses2);
+
+				ci1->mConditionRoot = newCondition;
+
+				// Remove the inner if-block
+				mergeLinesInto(ci1->mLines, ci2->mLines);
+				ci1->mIfBlock.erase(0, 1);
+
+				--pos;		// Check again at the same position
+			}
+
+			// Check for multiple successive if-blocks that are just conditional jumps to the same address, to merge into one if-block combining both conditions using ||
+			for (size_t pos = 0; pos + 1 < block.size(); ++pos)
+			{
+				CodeIfElse* ci1 = block[pos].cast<CodeIfElse>();
+				CodeIfElse* ci2 = block[pos + 1].cast<CodeIfElse>();
+				if (nullptr == ci1 || !ci1->mConditionRoot.valid() || ci1->mIfBlock.size() != 1 || !ci1->mElseBlock.empty())
+					continue;
+				if (nullptr == ci2 || !ci2->mConditionRoot.valid() || ci2->mIfBlock.size() != 1 || !ci2->mElseBlock.empty())
+					continue;
+
+				const CodeJumpOrCall* jumpCode1 = ci1->mIfBlock[0].cast<CodeJumpOrCall>();
+				if (nullptr == jumpCode1 || jumpCode1->mIsCall)
+					continue;
+
+				const CodeJumpOrCall* jumpCode2 = ci2->mIfBlock[0].cast<CodeJumpOrCall>();
+				if (nullptr == jumpCode2 || jumpCode2->mIsCall)
+					continue;
+
+				if (jumpCode1->mDestinationAddress != jumpCode2->mDestinationAddress)
+					continue;
+
+				// Merge the conditions
+				lemon::TokenPtr<lemon::StatementToken> newCondition;
+				lemon::BinaryOperationToken& bot = newCondition.create<lemon::BinaryOperationToken>();
+				bot.mOperator = lemon::Operator::LOGICAL_OR;
+				bot.mDataType = &lemon::PredefinedDataTypes::BOOL;
+
+				const bool needsParentheses1 = TokenTreeConverter::needsParentheses(ci1->mConditionRoot, bot.mOperator, false);
+				const bool needsParentheses2 = TokenTreeConverter::needsParentheses(ci2->mConditionRoot, bot.mOperator, true);
+
+				TokenTreeConverter::putWithOptionalParenthesis(bot.mLeft, *ci1->mConditionRoot, needsParentheses1);
+				TokenTreeConverter::putWithOptionalParenthesis(bot.mRight, *ci2->mConditionRoot, needsParentheses2);
+
+				ci1->mConditionRoot = newCondition;
+
+				// Remove the second if-block
+				mergeCodes(block, (int)pos, 2);
+				--pos;		// Check again at the same position
+			}
 		}
 
-	}
+	}	// namespace detail
+
 
 
 	void Optimization::optimize(Block& block)
 	{
-		detail::createStructuredBlocks(block);
+		Structuring::createStructuredBlocks(block);
 		detail::postprocessIfBlocks(block, nullptr);
 
-		// Build list of all blocks, including inner blocks of if/else/while
-		std::vector<Block*> allBlocks;
-		detail::collectInnerBlocks(block, allBlocks);
-
-		for (Block* childBlock : allBlocks)
+		// Go through all blocks, including inner blocks of if/else/while
+		Helper::foreachBlockInside(block, [](Block& childBlock)
 		{
-			detail::optimizeBlock(*childBlock);
-		}
+			detail::optimizeBlock(childBlock);
+		}, false);
 	}
 
 }
