@@ -1,0 +1,45 @@
+
+WHAT YOU NEED
+
+1) A binary file containing Motorola 68000 machine code to be converted, like a Sega Genesis / Mega Drive ROM file.
+
+2) A list of addresses inside that file where actual machine code is located. The application willl run a search for
+directly reachable code from there, but can't find code that is only indirectly reachable (i.e. via calls and jumps
+whose target addresses get calculated at run-time). So you need to deliver these so-called "seed addresses" for all
+code you like to have converted.
+
+
+
+RUN THE EXAMPLE
+
+- The example is for the "Sonic 3 & Knuckles" ROM. You need the one you can buy from Steam at https://store.steampowered.com/app/71162/Sonic_3__Knuckles/ .
+- Place the "Sonic 3 & Knuckles" ROM in the "projects/sonic3k" folder.
+- Run the Lemonizer application.
+- The result is "index.htm" (to be viewed in a web browser) and "index.lemon" (a text file) inside "projects/sonic3k".
+
+
+
+SETUP
+
+- Create a new project folder inside "projects" e.g. by copying an existing one. Or just re-use "sonic3k" in there.
+- In the config.json next to this text file, enter that folder name under the "Project" key.
+- Inside the project folder, open the project.json for the next steps.
+- Fill in a name as you like under "Name" there, and the binary file / ROM file name under "RomFile".
+- Fill in the array of seed addresses. At least one seed address or alternatively a jump target (see below) is needed.
+- Leave the "JumpTargets" list empty if not used. See the "Advanced" section below.
+
+
+
+ADVANCED: JUMP TARGETS
+
+By filling in the "JumpTargets" list, you can tell the application about which indirect jumps and calls lead to which
+addresses. This is a better way of adding seed addresses, but requires more information from you.
+The benefit of this is that the index.htm written as output can consider this kind of jump / call when listing the
+entry points of functions and which other functions are called by them.
+
+A jump target entry is a JSON line in the following form:
+	"0x00021e": [ "0x000300", "0x000320", "0x000364" ]
+where the key (here: 0x00021e) is the indirect jump's or call's own address, and the value is an array of target
+addresses (here: 0x000300, 0x000320, and 0x000364).
+
+

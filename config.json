@@ -1,0 +1,5 @@
+{
+	// Name of the project folder to use inside "project".
+	// That's where the project.json is expected, and where the output gets written to.
+	"Project": "sonic3k"
+}

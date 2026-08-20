@@ -1,0 +1,110 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\..\source\main.cpp" />
+    <ClCompile Include="..\..\source\lemonizer\LemonizerCode.cpp">
+      <Filter>lemonizer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\lemonizer\LemonizerFormatter.cpp">
+      <Filter>lemonizer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\lemonizer\LemonizerOptimization.cpp">
+      <Filter>lemonizer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\builder\RomContent.cpp">
+      <Filter>builder</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\assembly\AssemblyDefinitions.cpp">
+      <Filter>assembly</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\assembly\AssemblyOpcodeParserHelper.cpp">
+      <Filter>assembly</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\assembly\AssemblyOpcodeTable.cpp">
+      <Filter>assembly</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\assembly\AssemblyFormatter.cpp">
+      <Filter>assembly</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\assembly\Disassembler.cpp">
+      <Filter>assembly</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\assembly\CodeOutputHelper.cpp">
+      <Filter>assembly</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\helper\PlatformFunctions.cpp">
+      <Filter>helper</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\builder\FunctionBuilder.cpp">
+      <Filter>builder</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\writer\HtmlWriter.cpp">
+      <Filter>writer</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\source\builder\ProjectData.cpp">
+      <Filter>builder</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="lemonizer">
+      <UniqueIdentifier>{cccecb6e-27ee-4e97-8be8-fe7b91a8d689}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="writer">
+      <UniqueIdentifier>{b20bb394-6896-4cf0-91ae-46bac3e848d4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="builder">
+      <UniqueIdentifier>{527f2973-d2fb-4e9b-9e3f-885e9a6f377a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="assembly">
+      <UniqueIdentifier>{0c570530-f152-46bf-800f-916320d2f27b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="helper">
+      <UniqueIdentifier>{6eab677e-6497-4d16-9f7f-433578bc9f02}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\source\writer\HtmlWriter.h">
+      <Filter>writer</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\lemonizer\LemonizerCode.h">
+      <Filter>lemonizer</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\lemonizer\LemonizerFormatter.h">
+      <Filter>lemonizer</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\lemonizer\LemonizerOptimization.h">
+      <Filter>lemonizer</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\builder\FunctionBuilder.h">
+      <Filter>builder</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\pch.h" />
+    <ClInclude Include="..\..\source\builder\RomContent.h">
+      <Filter>builder</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\assembly\AssemblyDefinitions.h">
+      <Filter>assembly</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\assembly\AssemblyOpcodeParserHelper.h">
+      <Filter>assembly</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\assembly\AssemblyOpcodeTable.h">
+      <Filter>assembly</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\assembly\AssemblyFormatter.h">
+      <Filter>assembly</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\assembly\Disassembler.h">
+      <Filter>assembly</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\assembly\CodeOutputHelper.h">
+      <Filter>assembly</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\helper\PlatformFunctions.h">
+      <Filter>helper</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\source\builder\ProjectData.h">
+      <Filter>builder</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
