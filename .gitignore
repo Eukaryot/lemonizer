@@ -1,0 +1,4 @@
+bin/
+build/_vstudio/.vs
+build/_vstudio/tmp
+build/_vstudio/*.user
